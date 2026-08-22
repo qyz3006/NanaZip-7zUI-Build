@@ -1,0 +1,64 @@
+name: Build NanaZip (7-Zip engine + Modern UI) Portable
+
+# 目标：在 GitHub 在线 Action 上编译 NanaZip（基于 7-Zip 引擎 + NanaZip Modern UI 皮肤），
+#       产出未签名的便携 exe，供本地直接运行（绕过 MSIX 签名限制）。
+# 用法：把本文件放到任意仓库的 .github/workflows/ 下，在 Actions 页手动 Run workflow 即可。
+#       本 workflow 不依赖 fork 权限——它直接 clone 官方 M2Team/NanaZip（含递归子模块）。
+
+on:
+  workflow_dispatch:        # 允许在 Actions 页面手动触发
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build-nanazip.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      POWERSHELL_TELEMETRY_OPTOUT: 1
+    steps:
+      - name: Checkout this workflow repo (shallow)
+        uses: actions/checkout@v6
+
+      - name: Clone NanaZip source (recursive submodules)
+        run: |
+          git clone --recursive --depth 1 https://github.com/M2Team/NanaZip.git NanaZipSrc
+          cd NanaZipSrc
+          git submodule update --init --recursive
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Clear local NuGet cache (workaround for failed restores on windows-latest)
+        run: dotnet nuget locals all --clear
+
+      - name: Build all targets (includes Classic + Modern entry points)
+        run: |
+          cd NanaZipSrc
+          MSBuild -binaryLogger:Output\BuildAllTargets.binlog -m BuildAllTargets.proj
+
+      - name: List built binaries (debug)
+        run: |
+          cd NanaZipSrc
+          Get-ChildItem -Recurse Output\Binaries\Root\Binaries -Include *.exe | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 200
+
+      - name: Upload Portable Binaries (unsigned, run locally)
+        uses: actions/upload-artifact@v7
+        with:
+          name: NanaZip_Portable
+          path: NanaZipSrc/Output/Binaries/Root/Binaries
+
+      - name: Upload Debug Symbols
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v7
+        with:
+          name: NanaZip_DebugSymbols
+          path: NanaZipSrc/Output/Binaries/Root/Symbols
+
+      - name: Upload Build Log (troubleshoot)
+        if: '!cancelled()'
+        uses: actions/upload-artifact@v7
+        with:
+          name: NanaZip_BuildLog
+          path: NanaZipSrc/Output/BuildAllTargets.binlog
