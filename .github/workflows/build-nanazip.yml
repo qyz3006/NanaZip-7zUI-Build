@@ -68,6 +68,27 @@ jobs:
           cd NanaZipSrc
           MSBuild -binaryLogger:Output\BuildAllTargets.binlog -m BuildAllTargets.proj
 
+      - name: Include Modern FileManager exe (missing from Packaging step)
+        shell: powershell
+        run: |
+          cd NanaZipSrc
+          $candidates = @(
+            "Output\Binaries\Release\NanaZipPackage\x64\NanaZip.Modern.FileManager.exe",
+            "Output\Binaries\Release\NanaZipPackage\ARM64\NanaZip.Modern.FileManager.exe"
+          )
+          foreach ($src in $candidates) {
+            if (Test-Path $src) {
+              $destDir = Split-Path $src
+              $base = Split-Path $destDir -Leaf
+              $dst = Join-Path "Output\Binaries\Root\Binaries" $base
+              if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Force -Path $dst | Out-Null }
+              Copy-Item $src $dst -Force
+              Write-Host ("Copied Modern exe -> {0}" -f $dst)
+            } else {
+              Write-Host ("WARN: Modern exe not found at {0}" -f $src)
+            }
+          }
+
       - name: List built binaries (debug)
         run: |
           cd NanaZipSrc
