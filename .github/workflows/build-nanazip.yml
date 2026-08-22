@@ -28,33 +28,34 @@ jobs:
           git submodule update --init --recursive
 
       - name: Patch NanaZip.Modern to tolerate XAML init failure (Win10 crash fix)
-        shell: pwsh
+        shell: python
         run: |
-          $f = "NanaZipSrc/NanaZip.Modern/App.cpp"
-          $txt = Get-Content $f -Raw
-          $old = '        this->AddRef();
-          winrt::check_hresult(::MileXamlGlobalInitialize());'
-          $new = '        this->AddRef();
-          // Workaround: on Windows 10, MileXamlGlobalInitialize can fail because
-          // CoreWindow::GetForCurrentThread() returns null (XAML Islands context).
-          // Swallow the failure instead of crashing the whole process so the
-          // Modern UI (built on XAML Islands / DesktopWindowXamlSource) still works.
-          try
-          {
-              ::MileXamlGlobalInitialize();
-          }
-          catch (...)
-          {
-              // Ignore. The Modern UI does not depend on CoreWindow for its
-              // primary functionality (progress/about/dialogs use XAML Islands).
-          }'
-          if ($txt -notmatch [regex]::Escape($old)) {
-            Write-Error "PATCH FAILED: target code not found in App.cpp"
-            exit 1
-          }
-          $txt = $txt.Replace($old, $new)
-          Set-Content $f $txt -NoNewline
-          Write-Host "Patched App.cpp successfully"
+          import io, sys
+          f = "NanaZipSrc/NanaZip.Modern/App.cpp"
+          with io.open(f, "r", encoding="utf-8") as fh:
+              txt = fh.read()
+          target = "winrt::check_hresult(::MileXamlGlobalInitialize());"
+          if target not in txt:
+              sys.stderr.write("PATCH FAILED: target not found in App.cpp\n")
+              sys.exit(1)
+          indent = "        "
+          replacement = (
+              indent + "try\n"
+              + indent + "{\n"
+              + indent + "    ::MileXamlGlobalInitialize();\n"
+              + indent + "}\n"
+              + indent + "catch (...)\n"
+              + indent + "{\n"
+              + indent + "    // Workaround: on Windows 10, MileXamlGlobalInitialize can fail because\n"
+              + indent + "    // CoreWindow::GetForCurrentThread() returns null (XAML Islands context).\n"
+              + indent + "    // Swallow the failure so the Modern UI (XAML Islands / DesktopWindowXamlSource)\n"
+              + indent + "    // still works instead of crashing the whole process.\n"
+              + indent + "}\n"
+          )
+          txt = txt.replace(target, replacement)
+          with io.open(f, "w", encoding="utf-8") as fh:
+              fh.write(txt)
+          sys.stdout.write("Patched App.cpp successfully\n")
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
