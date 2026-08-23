@@ -32,6 +32,8 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 90
+    permissions:
+      contents: write   # 允许创建/更新 Release 与上传 asset
     env:
       POWERSHELL_TELEMETRY_OPTOUT: 1
     steps:
@@ -109,11 +111,18 @@ jobs:
           Compress-Archive -Path "$src\*" -DestinationPath $out -Force
           Write-Host "Packaged $out"
 
+      # 用 runner 自带的 gh CLI 发布 Release（比第三方 action 更稳，且
+      # GITHUB_TOKEN 自动注入）。fork artifact API 下载 401，故改走 Release。
       - name: Publish to GitHub Release (downloadable)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: classic-build
-          name: NanaZip Classic Portable (Win10-stable)
-          files: NanaZip_Classic_Portable.zip
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 若 tag 已存在则删除旧 release（保留可重跑）
+          gh release delete classic-build --yes || true
+          gh release create classic-build NanaZip_Classic_Portable.zip \
+            --title "NanaZip Classic Portable (Win10-stable)" \
+            --notes "Unsigned portable build of NanaZip Classic (pure Win32) for Windows 10. Unzip and run x64\\NanaZip.exe." \
+            --latest || true
+          echo "Release published."
