@@ -1,37 +1,28 @@
-name: Build NanaZip (7-Zip engine + Modern UI) Portable
+name: Build NanaZip Classic (pure-Win32) Portable
 
-# 目标：在 GitHub 在线 Action 上编译 NanaZip（基于 7-Zip 引擎 + NanaZip Modern UI 皮肤），
-#       产出未签名的便携 exe，供本地直接运行（绕过 MSIX 签名限制）。
+# 目标：在 GitHub 在线 Action 上编译 NanaZip 的 **Classic 纯 Win32 文件管理器**
+#       （NanaZip.UI.Classic），产出未签名的便携 NanaZip.exe，供本地直接在
+#       Windows 10 上运行。
 #
-# 根因修复闭环（已验证源码，2026-08-23）：
-# NanaZip Modern 在 Win10 上白屏 + 静默 __fastfail 0xC0000409 退出，源于
-# Mile.Xaml 2.5.1616 的 Mile.Xaml.cpp 在 ContentWindow WM_CREATE 中无条件调用
-#   ::MileSetWindowSystemBackdropTypeAttribute(hWnd, MILE_WINDOW_SYSTEM_BACKDROP_TYPE_MICA)
-# Mica 是 Win11-only 的 DWM 特性；在 Win10 上框架内部的 Mica 路径未定义，
-# 触发栈损坏（/GS 保护 __fastfail）。这与 NanaZip issue #400 描述的
-# CoreWindow/twinapi.appcore.dll Win10 不兼容家族同源。
+# 为什么只编 Classic（γ 收敛，2026-08-24）：
+#   NanaZip Modern (WinUI3/XAML Islands) 在 Win10 上整体不兼容（issue #400 家族：
+#   twinapi.appcore.dll / XAML 框架 init 不完整 -> 白屏、卡死、__fastfail 0xC0000409）。
+#   代码级补丁（Mica guard）只能延后崩溃，救不了渲染。而 Classic 是纯 Win32、
+#   零 XAML / 零 WinAppSDK 依赖，Win10 稳定。用户最终只需 x64\NanaZip.exe。
 #
-# 修复策略（α2 — 本地源码覆盖，零 NuGet 发包、零污染）：
-# Mile.Xaml 的 NuGet 包把 Mile.Xaml.cpp 源码打包进 Source/Native，NanaZip 通过
-# build/native/Mile.Xaml.targets 的 BeforeClCompile 钩子把该 .cpp 直接编进自己的
-# Modern 项目（不是外部 lib）。因此修复 = 让 NanaZip 编译到的 Mile.Xaml.cpp 是被
-# patch 过的版本。
-#   1) fork ProjectMile/Mile.Xaml -> qyz3006/Mile.Xaml（已含 Win10 guard 修复，手工 push 完成）。
-#   2) CI 从 qyz3006/Mile.Xaml 拉取 patch 后的 Mile.Xaml.cpp。
-#   3) CI restore NanaZip 后，把 patch 文件覆盖进全局 NuGet 包目录的
-#      Source/Native/Mile.Xaml.cpp（路径自探测）。
-#   4) 编译 NanaZip，Modern 项目重新编译该 .cpp，Win10 走 NONE 分支不再崩溃。
+# 为什么放弃 BuildAllTargets.proj（2026-08-24 实证）：
+#   原先整个方案走 BuildAllTargets.proj，其 Restore 阶段要还原整个 NanaZip.slnx，
+#   含 WinAppSDK / Mile.Xaml 2.5.1616 等数十个来自 nuget.org 的大包。在 GitHub
+#   Windows runner 上该 Restore 反复无限挂起（观测：4 个 run 全部卡在 Restore 步骤
+#   in_progress 数小时，加 18min 硬超时后 fail）。而 Classic 项目只依赖 2 个小包
+#   （Mile.Windows.Helpers / Mile.Windows.UniCrt，同作者、体积小）。因此本版
+#   **完全跳过 Modern 还原/构建链**，仅 restore+build Classic，根除了 restore 卡点。
 #
-# γ 方案：Win10 放弃 Modern 皮肤，改用 Classic 纯 Win32 文件管理器（稳定）。
-#
-# 2026-08-24 健壮性修复：
-#   之前 run 在 job 启动后 ~1s 即冻结（updated_at 不再变化），根因为
-#   `git clone --recursive` 在 Windows runner 上对子模块 https 拉取无限挂起。
-#   本版改为：主仓浅克隆 + 子模块独立更新（均包 timeout，避免无限挂起）；
-#   所有耗时长步骤加 timeout-minutes；clone/submodule 配置 http 低速率超时。
+# 健壮性（沿用 2026-08-24）：clone/submodule 均包 timeout，防无限挂起；
+# 所有长步骤加 timeout-minutes。
 
 on:
-  workflow_dispatch:        # 允许在 Actions 页面手动触发
+  workflow_dispatch:
   push:
     branches: [ main, master ]
     paths:
@@ -40,7 +31,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
       POWERSHELL_TELEMETRY_OPTOUT: 1
     steps:
@@ -52,165 +43,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # 防止 git 在网络抖动时无限挂起
           git config --global http.lowSpeedLimit 1000
           git config --global http.lowSpeedTime 30
           git config --global https.lowSpeedLimit 1000
           git config --global https.lowSpeedTime 30
-          # 主仓浅克隆（不 recursive，避免一次性拉全部子模块挂死）
           timeout 600 git clone --depth 1 https://github.com/M2Team/NanaZip.git NanaZipSrc
           cd NanaZipSrc
-          # 子模块独立更新，浅层，带超时
           timeout 900 git submodule update --init --recursive --depth 1
           echo "=== NanaZipSrc top level ==="
           ls -la
 
-      # ------------------------------------------------------------------
-      # 1) Acquire the patched Mile.Xaml.cpp from the fork (qyz3006/Mile.Xaml).
-      #    The fork already contains the Win10 Mica guard fix. We clone it
-      #    shallow to extract just the native source file.
-      # ------------------------------------------------------------------
-      - name: Fetch patched Mile.Xaml native source from fork
-        timeout-minutes: 5
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf Mile.Xaml.Fork
-          timeout 300 git clone --depth 1 https://github.com/qyz3006/Mile.Xaml.git Mile.Xaml.Fork
-          echo "Patched Mile.Xaml.cpp head:"
-          sed -n '224,244p' Mile.Xaml.Fork/Mile.Xaml.Native/Mile.Xaml.cpp
-
-      # ------------------------------------------------------------------
-      # 2) Restore NanaZip so the Mile.Xaml 2.5.1616 NuGet package is unpacked
-      #    into the global packages cache. The package ships Mile.Xaml.cpp as
-      #    Source/Native, which NanaZip compiles into its Modern project.
-      # ------------------------------------------------------------------
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
-      - name: Restore NanaZip (unpack NuGet packages)
-        # GitHub Windows runner -> nuget.org 网络偶发无限挂起（观测到多次
-        # restore 步骤 in_progress 数小时无进展）。硬性超时 18 分钟，超时即
-        # fail，避免无声冻结浪费 2 小时配额；fail 后由调度方重 dispatch。
-        timeout-minutes: 18
-        run: |
-          cd NanaZipSrc
-          # 单线程 restore 降低并发连接数，减少在受限网络下卡死概率；
-          # 失败立即非零退出（set -e 已在 bash 层，这里显式检查）。
-          msbuild -restore BuildAllTargets.proj /p:RestorePackagesConfig=true /p:RestoreDisableParallel=true
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Overwrite Mile.Xaml.cpp in NuGet cache with patched version
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          $pkgRoot = (& nuget locals global-packages -list | Select-String 'global-packages: (.*)' | ForEach-Object { $_.Matches.Groups[1].Value.TrimEnd('\') })
-          if (-not $pkgRoot) { $pkgRoot = "$env:USERPROFILE\.nuget\packages" }
-          $target = Join-Path $pkgRoot "mile.xaml\2.5.1616\source\native\Mile.Xaml.cpp"
-          Write-Host "NuGet global cache root: $pkgRoot"
-          Write-Host "Target Mile.Xaml.cpp: $target"
-          if (-not (Test-Path $target)) {
-            Write-Error "PATCH TARGET NOT FOUND: $target. Restore may have placed the package elsewhere."
-            exit 1
-          }
-          Copy-Item -Force "Mile.Xaml.Fork\Mile.Xaml.Native\Mile.Xaml.cpp" $target
-          Write-Host "Overwrote Mile.Xaml.cpp with Win10 Mica-guard fix."
-          # Also refresh the .h in case future patches touch it (no-op for this fix)
-          $hTarget = Join-Path $pkgRoot "mile.xaml\2.5.1616\source\native\Mile.Xaml.h"
-          if (Test-Path "Mile.Xaml.Fork\Mile.Xaml.Native\Mile.Xaml.h") {
-            Copy-Item -Force "Mile.Xaml.Fork\Mile.Xaml.Native\Mile.Xaml.h" $hTarget
-          }
-
-      - name: Clear incremental build cache for Mile.Xaml.cpp (force recompile)
-        timeout-minutes: 5
-        shell: pwsh
-        run: |
-          # Remove any stale .obj so MSBuild recompiles the patched source.
-          $pkgRoot = (& nuget locals global-packages -list | Select-String 'global-packages: (.*)' | ForEach-Object { $_.Matches.Groups[1].Value.TrimEnd('\') })
-          if (-not $pkgRoot) { $pkgRoot = "$env:USERPROFILE\.nuget\packages" }
-          Get-ChildItem -Path $pkgRoot -Recurse -Filter "Mile.Xaml.cpp.obj" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-          Write-Host "Stale Mile.Xaml.cpp.obj cleared (if any)."
-
-      - name: Build all targets (compiles NanaZipPackage.wapproj = MSIX entry
-          project NanaZip.Modern.FileManager.exe + Universal launchers)
-        timeout-minutes: 90
-        run: |
-          cd NanaZipSrc
-          MSBuild -binaryLogger:Output\BuildAllTargets.binlog -m BuildAllTargets.proj
-
-      - name: List built binaries (debug)
-        timeout-minutes: 5
-        run: |
-          cd NanaZipSrc
-          Get-ChildItem -Recurse Output\Binaries\Root\Binaries -Include *.exe | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 200
-
       # ------------------------------------------------------------------
-      # 3) The real Modern file-manager launcher (NanaZip.Modern.FileManager.exe)
-      #    is the MSIX entry point compiled by NanaZipPackage.wapproj, but the
-      #    upstream Packaging step only copies NanaZip.Modern.dll + the two
-      #    Universal exes into the portable layout. So the actual GUI you
-      #    double-click (which was showing the Win10 Mica crash / white screen)
-      #    is MISSING from the artifact. Locate it recursively and fold it in
-      #    together with its co-located dependencies (Modern.dll/.xbf/resources.pri).
+      # 仅还原 + 构建 Classic（纯 Win32）。只拉 2 个 Mile 小包，避免 Modern
+      # 链（WinAppSDK/Mile.Xaml 等数十个大包）在 runner 上无限挂起。
       # ------------------------------------------------------------------
-      - name: Locate and include Modern FileManager launcher in portable layout
-        timeout-minutes: 10
-        shell: pwsh
-        run: |
-          $root = "NanaZipSrc\Output\Binaries"
-          $destX64 = Join-Path $root "Root\Binaries\x64"
-          $destARM64 = Join-Path $root "Root\Binaries\arm64"
-
-          # Find ALL compiled Modern FileManager exes (x64 AND arm64 are both built
-          # by NanaZipPackage.wapproj). We must fold in every arch, not just the
-          # first one returned by Get-ChildItem (prev bug: -First 1 only copied arm64).
-          $fmExes = Get-ChildItem -Path $root -Recurse -Filter "NanaZip.Modern.FileManager.exe" -ErrorAction SilentlyContinue
-          if ($fmExes.Count -eq 0) {
-            Write-Error "Modern FileManager exe NOT FOUND after build. Build may have skipped the MSIX entry project."
-            exit 1
-          }
-          Write-Host "Found $($fmExes.Count) Modern FileManager exe(s):"
-          $fmExes | ForEach-Object { Write-Host "  $($_.FullName)" }
-
-          $companionPatterns = @("NanaZip.Modern.FileManager.exe",
-                                  "NanaZip.Modern.dll",
-                                  "Mile.Xaml.Styles.SunValley.xbf",
-                                  "resources.pri")
-
-          foreach ($fmExe in $fmExes) {
-            # Determine arch by parent folder name (x64/arm64) of the discovered exe.
-            $arch = Split-Path (Split-Path $fmExe.FullName -Parent) -Leaf
-            if ($arch -eq "x64") { $dest = $destX64 }
-            elseif ($arch -eq "arm64") { $dest = $destARM64 }
-            else { Write-Warning "Unknown arch folder '$arch' for $($fmExe.FullName), defaulting to x64"; $dest = $destX64 }
-
-            New-Item -ItemType Directory -Force -Path $dest | Out-Null
-
-            # Copy the exe and everything sitting next to it that the Modern UI needs.
-            $srcDir = Split-Path $fmExe.FullName -Parent
-            foreach ($p in $companionPatterns) {
-              $f = Join-Path $srcDir $p
-              if (Test-Path $f) { Copy-Item -Force $f $dest; Write-Host "Copied $p -> $dest" }
-              else { Write-Host "Companion not present (skip): $p" }
-            }
-            Write-Host "Modern FileManager (arch=$arch) folded into portable layout at $dest"
-          }
-
-      # ------------------------------------------------------------------
-      # 4) GAMMA FALLBACK for Windows 10: NanaZip Modern (WinUI3/XAML Islands)
-      #    is fundamentally incompatible with Win10 (issue #400 family:
-      #    twinapi.appcore.dll / XAML framework init incomplete -> UI shows
-      #    white, hangs, then crashes). Code-level patches (Mica guard) only
-      #    delay the crash, not fix rendering. The stable Win10 path is the
-      #    CLASSIC pure-Win32 file manager (NanaZip.UI.Classic, zero XAML /
-      #    WinAppSDK dependency). Build it and fold NanaZip.exe into the
-      #    portable layout so Win10 users get a working GUI.
-      # ------------------------------------------------------------------
-      - name: Build Classic (pure-Win32) UI for Windows 10 compatibility
-        timeout-minutes: 60
+      - name: Build Classic x64 (pure-Win32, Win10-stable)
+        timeout-minutes: 40
         run: |
           cd NanaZipSrc
           MSBuild -restore -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=x64 /p:Configuration=Release
+
+      - name: Build Classic arm64 (pure-Win32, Win10-stable)
+        timeout-minutes: 40
+        run: |
+          cd NanaZipSrc
           MSBuild -restore -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=arm64 /p:Configuration=Release
 
       - name: Locate and include Classic NanaZip.exe in portable layout
@@ -239,22 +98,8 @@ jobs:
             Write-Host "Copied Classic NanaZip.exe -> $dest"
           }
 
-      - name: Upload Portable Binaries (unsigned, run locally)
+      - name: Upload Portable Binaries (unsigned, run locally on Win10)
         uses: actions/upload-artifact@v7
         with:
-          name: NanaZip_Portable
+          name: NanaZip_Classic_Portable
           path: NanaZipSrc/Output/Binaries/Root/Binaries
-
-      - name: Upload Debug Symbols
-        if: '!cancelled()'
-        uses: actions/upload-artifact@v7
-        with:
-          name: NanaZip_DebugSymbols
-          path: NanaZipSrc/Output/Binaries/Root/Symbols
-
-      - name: Upload Build Log (troubleshoot)
-        if: '!cancelled()'
-        uses: actions/upload-artifact@v7
-        with:
-          name: NanaZip_BuildLog
-          path: NanaZipSrc/Output/BuildAllTargets.binlog
