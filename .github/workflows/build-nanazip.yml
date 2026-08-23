@@ -3,7 +3,25 @@ name: Build NanaZip (7-Zip engine + Modern UI) Portable
 # 目标：在 GitHub 在线 Action 上编译 NanaZip（基于 7-Zip 引擎 + NanaZip Modern UI 皮肤），
 #       产出未签名的便携 exe，供本地直接运行（绕过 MSIX 签名限制）。
 # 用法：把本文件放到任意仓库的 .github/workflows/ 下，在 Actions 页手动 Run workflow 即可。
-#       本 workflow 不依赖 fork 权限——它直接 clone 官方 M2Team/NanaZip（含递归子模块）。
+#
+# 根因修复闭环（已验证源码，2026-08-23）：
+# NanaZip Modern 在 Win10 上白屏 + 静默 __fastfail 0xC0000409 退出，源于
+# Mile.Xaml 2.5.1616 的 Mile.Xaml.cpp 在 ContentWindow WM_CREATE 中无条件调用
+#   ::MileSetWindowSystemBackdropTypeAttribute(hWnd, MILE_WINDOW_SYSTEM_BACKDROP_TYPE_MICA)
+# Mica 是 Win11-only 的 DWM 特性；在 Win10 上框架内部的 Mica 路径未定义，
+# 触发栈损坏（/GS 保护 __fastfail）。这与 NanaZip issue #400 描述的
+# CoreWindow/twinapi.appcore.dll Win10 不兼容家族同源。
+#
+# 修复策略（α2 — 本地源码覆盖，零 NuGet 发包、零污染）：
+# Mile.Xaml 的 NuGet 包把 Mile.Xaml.cpp 源码打包进 Source/Native，NanaZip 通过
+# build/native/Mile.Xaml.targets 的 BeforeClCompile 钩子把该 .cpp 直接编进自己的
+# Modern 项目（不是外部 lib）。因此修复 = 让 NanaZip 编译到的 Mile.Xaml.cpp 是被
+# patch 过的版本。
+#   1) fork ProjectMile/Mile.Xaml -> qyz3006/Mile.Xaml（已含 Win10 guard 修复，手工 push 完成）。
+#   2) CI 从 qyz3006/Mile.Xaml 拉取 patch 后的 Mile.Xaml.cpp。
+#   3) CI restore NanaZip 后，把 patch 文件覆盖进全局 NuGet 包目录的
+#      Source/Native/Mile.Xaml.cpp（路径自探测）。
+#   4) 编译 NanaZip，Modern 项目重新编译该 .cpp，Win10 走 NONE 分支不再崩溃。
 
 on:
   workflow_dispatch:        # 允许在 Actions 页面手动触发
@@ -27,67 +45,66 @@ jobs:
           cd NanaZipSrc
           git submodule update --init --recursive
 
-      - name: Patch NanaZip.Modern to tolerate XAML init failure (Win10 crash fix)
-        shell: python
+      # ------------------------------------------------------------------
+      # 1) Acquire the patched Mile.Xaml.cpp from the fork (qyz3006/Mile.Xaml).
+      #    The fork already contains the Win10 Mica guard fix. We clone it
+      #    shallow to extract just the native source file.
+      # ------------------------------------------------------------------
+      - name: Fetch patched Mile.Xaml native source from fork
+        shell: bash
         run: |
-          import io, sys
-          f = "NanaZipSrc/NanaZip.Modern/App.cpp"
-          with io.open(f, "r", encoding="utf-8") as fh:
-              txt = fh.read()
-          target = "winrt::check_hresult(::MileXamlGlobalInitialize());"
-          if target not in txt:
-              sys.stderr.write("PATCH FAILED: target not found in App.cpp\n")
-              sys.exit(1)
-          indent = "        "
-          replacement = (
-              indent + "try\n"
-              + indent + "{\n"
-              + indent + "    ::MileXamlGlobalInitialize();\n"
-              + indent + "}\n"
-              + indent + "catch (...)\n"
-              + indent + "{\n"
-              + indent + "    // Workaround: on Windows 10, MileXamlGlobalInitialize can fail because\n"
-              + indent + "    // CoreWindow::GetForCurrentThread() returns null (XAML Islands context).\n"
-              + indent + "    // Swallow the failure so the Modern UI (XAML Islands / DesktopWindowXamlSource)\n"
-              + indent + "    // still works instead of crashing the whole process.\n"
-              + indent + "}\n"
-          )
-          txt = txt.replace(target, replacement)
-          with io.open(f, "w", encoding="utf-8") as fh:
-              fh.write(txt)
-          sys.stdout.write("Patched App.cpp successfully\n")
+          set -euo pipefail
+          rm -rf Mile.Xaml.Fork
+          git clone --depth 1 https://github.com/qyz3006/Mile.Xaml.git Mile.Xaml.Fork
+          echo "Patched Mile.Xaml.cpp head:"
+          sed -n '224,244p' Mile.Xaml.Fork/Mile.Xaml.Native/Mile.Xaml.cpp
 
+      # ------------------------------------------------------------------
+      # 2) Restore NanaZip so the Mile.Xaml 2.5.1616 NuGet package is unpacked
+      #    into the global packages cache. The package ships Mile.Xaml.cpp as
+      #    Source/Native, which NanaZip compiles into its Modern project.
+      # ------------------------------------------------------------------
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
-      - name: Clear local NuGet cache (workaround for failed restores on windows-latest)
-        run: dotnet nuget locals all --clear
+      - name: Restore NanaZip (unpack NuGet packages)
+        run: |
+          cd NanaZipSrc
+          msbuild -restore BuildAllTargets.proj /p:RestorePackagesConfig=true
+
+      - name: Overwrite Mile.Xaml.cpp in NuGet cache with patched version
+        shell: pwsh
+        run: |
+          $pkgRoot = (& nuget locals global-packages -list | Select-String 'global-packages: (.*)' | ForEach-Object { $_.Matches.Groups[1].Value.TrimEnd('\') })
+          if (-not $pkgRoot) { $pkgRoot = "$env:USERPROFILE\.nuget\packages" }
+          $target = Join-Path $pkgRoot "mile.xaml\2.5.1616\source\native\Mile.Xaml.cpp"
+          Write-Host "NuGet global cache root: $pkgRoot"
+          Write-Host "Target Mile.Xaml.cpp: $target"
+          if (-not (Test-Path $target)) {
+            Write-Error "PATCH TARGET NOT FOUND: $target. Restore may have placed the package elsewhere."
+            exit 1
+          }
+          Copy-Item -Force "Mile.Xaml.Fork\Mile.Xaml.Native\Mile.Xaml.cpp" $target
+          Write-Host "Overwrote Mile.Xaml.cpp with Win10 Mica-guard fix."
+          # Also refresh the .h in case future patches touch it (no-op for this fix)
+          $hTarget = Join-Path $pkgRoot "mile.xaml\2.5.1616\source\native\Mile.Xaml.h"
+          if (Test-Path "Mile.Xaml.Fork\Mile.Xaml.Native\Mile.Xaml.h") {
+            Copy-Item -Force "Mile.Xaml.Fork\Mile.Xaml.Native\Mile.Xaml.h" $hTarget
+          }
+
+      - name: Clear incremental build cache for Mile.Xaml.cpp (force recompile)
+        shell: pwsh
+        run: |
+          # Remove any stale .obj so MSBuild recompiles the patched source.
+          $pkgRoot = (& nuget locals global-packages -list | Select-String 'global-packages: (.*)' | ForEach-Object { $_.Matches.Groups[1].Value.TrimEnd('\') })
+          if (-not $pkgRoot) { $pkgRoot = "$env:USERPROFILE\.nuget\packages" }
+          Get-ChildItem -Path $pkgRoot -Recurse -Filter "Mile.Xaml.cpp.obj" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+          Write-Host "Stale Mile.Xaml.cpp.obj cleared (if any)."
 
       - name: Build all targets (includes Classic + Modern entry points)
         run: |
           cd NanaZipSrc
           MSBuild -binaryLogger:Output\BuildAllTargets.binlog -m BuildAllTargets.proj
-
-      - name: Include Modern FileManager exe (missing from Packaging step)
-        shell: powershell
-        run: |
-          cd NanaZipSrc
-          $candidates = @(
-            "Output\Binaries\Release\NanaZipPackage\x64\NanaZip.Modern.FileManager.exe",
-            "Output\Binaries\Release\NanaZipPackage\ARM64\NanaZip.Modern.FileManager.exe"
-          )
-          foreach ($src in $candidates) {
-            if (Test-Path $src) {
-              $destDir = Split-Path $src
-              $base = Split-Path $destDir -Leaf
-              $dst = Join-Path "Output\Binaries\Root\Binaries" $base
-              if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Force -Path $dst | Out-Null }
-              Copy-Item $src $dst -Force
-              Write-Host ("Copied Modern exe -> {0}" -f $dst)
-            } else {
-              Write-Host ("WARN: Modern exe not found at {0}" -f $src)
-            }
-          }
 
       - name: List built binaries (debug)
         run: |
