@@ -163,6 +163,47 @@ jobs:
             Write-Host "Modern FileManager (arch=$arch) folded into portable layout at $dest"
           }
 
+      # ------------------------------------------------------------------
+      # 4) GAMMA FALLBACK for Windows 10: NanaZip Modern (WinUI3/XAML Islands)
+      #    is fundamentally incompatible with Win10 (issue #400 family:
+      #    twinapi.appcore.dll / XAML framework init incomplete -> UI shows
+      #    white, hangs, then crashes). Code-level patches (Mica guard) only
+      #    delay the crash, not fix rendering. The stable Win10 path is the
+      #    CLASSIC pure-Win32 file manager (NanaZip.UI.Classic, zero XAML /
+      #    WinAppSDK dependency). Build it and fold NanaZip.exe into the
+      #    portable layout so Win10 users get a working GUI.
+      # ------------------------------------------------------------------
+      - name: Build Classic (pure-Win32) UI for Windows 10 compatibility
+        run: |
+          cd NanaZipSrc
+          MSBuild -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=x64 /p:Configuration=Release
+          MSBuild -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=arm64 /p:Configuration=Release
+
+      - name: Locate and include Classic NanaZip.exe in portable layout
+        shell: pwsh
+        run: |
+          $root = "NanaZipSrc\Output\Binaries"
+          $destX64 = Join-Path $root "Root\Binaries\x64"
+          $destARM64 = Join-Path $root "Root\Binaries\arm64"
+
+          $classicExes = Get-ChildItem -Path $root -Recurse -Filter "NanaZip.exe" -ErrorAction SilentlyContinue
+          if ($classicExes.Count -eq 0) {
+            Write-Error "Classic NanaZip.exe NOT FOUND after build."
+            exit 1
+          }
+          Write-Host "Found $($classicExes.Count) Classic exe(s):"
+          $classicExes | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+          foreach ($ce in $classicExes) {
+            $arch = Split-Path (Split-Path $ce.FullName -Parent) -Leaf
+            if ($arch -eq "x64") { $dest = $destX64 }
+            elseif ($arch -eq "arm64") { $dest = $destARM64 }
+            else { Write-Warning "Unknown arch '$arch' for $($ce.FullName), default x64"; $dest = $destX64 }
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Copy-Item -Force $ce.FullName $dest
+            Write-Host "Copied Classic NanaZip.exe -> $dest"
+          }
+
       - name: Upload Portable Binaries (unsigned, run locally)
         uses: actions/upload-artifact@v7
         with:
