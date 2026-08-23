@@ -128,31 +128,40 @@ jobs:
           $destX64 = Join-Path $root "Root\Binaries\x64"
           $destARM64 = Join-Path $root "Root\Binaries\arm64"
 
-          # Find the compiled Modern FileManager exe anywhere under Output\Binaries.
-          $fmExe = Get-ChildItem -Path $root -Recurse -Filter "NanaZip.Modern.FileManager.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $fmExe) {
+          # Find ALL compiled Modern FileManager exes (x64 AND arm64 are both built
+          # by NanaZipPackage.wapproj). We must fold in every arch, not just the
+          # first one returned by Get-ChildItem (prev bug: -First 1 only copied arm64).
+          $fmExes = Get-ChildItem -Path $root -Recurse -Filter "NanaZip.Modern.FileManager.exe" -ErrorAction SilentlyContinue
+          if ($fmExes.Count -eq 0) {
             Write-Error "Modern FileManager exe NOT FOUND after build. Build may have skipped the MSIX entry project."
             exit 1
           }
-          Write-Host "Found Modern FileManager exe: $($fmExe.FullName)"
+          Write-Host "Found $($fmExes.Count) Modern FileManager exe(s):"
+          $fmExes | ForEach-Object { Write-Host "  $($_.FullName)" }
 
-          # Determine arch by parent folder name (x64/arm64) of the discovered exe.
-          $arch = Split-Path (Split-Path $fmExe.FullName -Parent) -Leaf
-          if ($arch -eq "x64") { $dest = $destX64 } elseif ($arch -eq "arm64") { $dest = $destARM64 } else { $dest = $destX64 }
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-
-          # Copy the exe and everything sitting next to it that the Modern UI needs.
-          $srcDir = Split-Path $fmExe.FullName -Parent
           $companionPatterns = @("NanaZip.Modern.FileManager.exe",
                                   "NanaZip.Modern.dll",
                                   "Mile.Xaml.Styles.SunValley.xbf",
                                   "resources.pri")
-          foreach ($p in $companionPatterns) {
-            $f = Join-Path $srcDir $p
-            if (Test-Path $f) { Copy-Item -Force $f $dest; Write-Host "Copied $p -> $dest" }
-            else { Write-Host "Companion not present (skip): $p" }
+
+          foreach ($fmExe in $fmExes) {
+            # Determine arch by parent folder name (x64/arm64) of the discovered exe.
+            $arch = Split-Path (Split-Path $fmExe.FullName -Parent) -Leaf
+            if ($arch -eq "x64") { $dest = $destX64 }
+            elseif ($arch -eq "arm64") { $dest = $destARM64 }
+            else { Write-Warning "Unknown arch folder '$arch' for $($fmExe.FullName), defaulting to x64"; $dest = $destX64 }
+
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+            # Copy the exe and everything sitting next to it that the Modern UI needs.
+            $srcDir = Split-Path $fmExe.FullName -Parent
+            foreach ($p in $companionPatterns) {
+              $f = Join-Path $srcDir $p
+              if (Test-Path $f) { Copy-Item -Force $f $dest; Write-Host "Copied $p -> $dest" }
+              else { Write-Host "Companion not present (skip): $p" }
+            }
+            Write-Host "Modern FileManager (arch=$arch) folded into portable layout at $dest"
           }
-          Write-Host "Modern FileManager folded into portable layout at $dest"
 
       - name: Upload Portable Binaries (unsigned, run locally)
         uses: actions/upload-artifact@v7
