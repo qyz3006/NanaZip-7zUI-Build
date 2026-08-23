@@ -2,7 +2,6 @@ name: Build NanaZip (7-Zip engine + Modern UI) Portable
 
 # 目标：在 GitHub 在线 Action 上编译 NanaZip（基于 7-Zip 引擎 + NanaZip Modern UI 皮肤），
 #       产出未签名的便携 exe，供本地直接运行（绕过 MSIX 签名限制）。
-# 用法：把本文件放到任意仓库的 .github/workflows/ 下，在 Actions 页手动 Run workflow 即可。
 #
 # 根因修复闭环（已验证源码，2026-08-23）：
 # NanaZip Modern 在 Win10 上白屏 + 静默 __fastfail 0xC0000409 退出，源于
@@ -22,6 +21,14 @@ name: Build NanaZip (7-Zip engine + Modern UI) Portable
 #   3) CI restore NanaZip 后，把 patch 文件覆盖进全局 NuGet 包目录的
 #      Source/Native/Mile.Xaml.cpp（路径自探测）。
 #   4) 编译 NanaZip，Modern 项目重新编译该 .cpp，Win10 走 NONE 分支不再崩溃。
+#
+# γ 方案：Win10 放弃 Modern 皮肤，改用 Classic 纯 Win32 文件管理器（稳定）。
+#
+# 2026-08-24 健壮性修复：
+#   之前 run 在 job 启动后 ~1s 即冻结（updated_at 不再变化），根因为
+#   `git clone --recursive` 在 Windows runner 上对子模块 https 拉取无限挂起。
+#   本版改为：主仓浅克隆 + 子模块独立更新（均包 timeout，避免无限挂起）；
+#   所有耗时长步骤加 timeout-minutes；clone/submodule 配置 http 低速率超时。
 
 on:
   workflow_dispatch:        # 允许在 Actions 页面手动触发
@@ -33,17 +40,30 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 120
     env:
       POWERSHELL_TELEMETRY_OPTOUT: 1
     steps:
       - name: Checkout this workflow repo (shallow)
         uses: actions/checkout@v6
 
-      - name: Clone NanaZip source (recursive submodules)
+      - name: Clone NanaZip source (robust, timeout-guarded)
+        timeout-minutes: 20
+        shell: bash
         run: |
-          git clone --recursive --depth 1 https://github.com/M2Team/NanaZip.git NanaZipSrc
+          set -euo pipefail
+          # 防止 git 在网络抖动时无限挂起
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 30
+          git config --global https.lowSpeedLimit 1000
+          git config --global https.lowSpeedTime 30
+          # 主仓浅克隆（不 recursive，避免一次性拉全部子模块挂死）
+          timeout 600 git clone --depth 1 https://github.com/M2Team/NanaZip.git NanaZipSrc
           cd NanaZipSrc
-          git submodule update --init --recursive
+          # 子模块独立更新，浅层，带超时
+          timeout 900 git submodule update --init --recursive --depth 1
+          echo "=== NanaZipSrc top level ==="
+          ls -la
 
       # ------------------------------------------------------------------
       # 1) Acquire the patched Mile.Xaml.cpp from the fork (qyz3006/Mile.Xaml).
@@ -51,11 +71,12 @@ jobs:
       #    shallow to extract just the native source file.
       # ------------------------------------------------------------------
       - name: Fetch patched Mile.Xaml native source from fork
+        timeout-minutes: 5
         shell: bash
         run: |
           set -euo pipefail
           rm -rf Mile.Xaml.Fork
-          git clone --depth 1 https://github.com/qyz3006/Mile.Xaml.git Mile.Xaml.Fork
+          timeout 300 git clone --depth 1 https://github.com/qyz3006/Mile.Xaml.git Mile.Xaml.Fork
           echo "Patched Mile.Xaml.cpp head:"
           sed -n '224,244p' Mile.Xaml.Fork/Mile.Xaml.Native/Mile.Xaml.cpp
 
@@ -68,11 +89,13 @@ jobs:
         uses: microsoft/setup-msbuild@v3
 
       - name: Restore NanaZip (unpack NuGet packages)
+        timeout-minutes: 30
         run: |
           cd NanaZipSrc
           msbuild -restore BuildAllTargets.proj /p:RestorePackagesConfig=true
 
       - name: Overwrite Mile.Xaml.cpp in NuGet cache with patched version
+        timeout-minutes: 5
         shell: pwsh
         run: |
           $pkgRoot = (& nuget locals global-packages -list | Select-String 'global-packages: (.*)' | ForEach-Object { $_.Matches.Groups[1].Value.TrimEnd('\') })
@@ -93,6 +116,7 @@ jobs:
           }
 
       - name: Clear incremental build cache for Mile.Xaml.cpp (force recompile)
+        timeout-minutes: 5
         shell: pwsh
         run: |
           # Remove any stale .obj so MSBuild recompiles the patched source.
@@ -103,11 +127,13 @@ jobs:
 
       - name: Build all targets (compiles NanaZipPackage.wapproj = MSIX entry
           project NanaZip.Modern.FileManager.exe + Universal launchers)
+        timeout-minutes: 90
         run: |
           cd NanaZipSrc
           MSBuild -binaryLogger:Output\BuildAllTargets.binlog -m BuildAllTargets.proj
 
       - name: List built binaries (debug)
+        timeout-minutes: 5
         run: |
           cd NanaZipSrc
           Get-ChildItem -Recurse Output\Binaries\Root\Binaries -Include *.exe | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 200
@@ -122,6 +148,7 @@ jobs:
       #    together with its co-located dependencies (Modern.dll/.xbf/resources.pri).
       # ------------------------------------------------------------------
       - name: Locate and include Modern FileManager launcher in portable layout
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $root = "NanaZipSrc\Output\Binaries"
@@ -174,12 +201,14 @@ jobs:
       #    portable layout so Win10 users get a working GUI.
       # ------------------------------------------------------------------
       - name: Build Classic (pure-Win32) UI for Windows 10 compatibility
+        timeout-minutes: 60
         run: |
           cd NanaZipSrc
-          MSBuild -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=x64 /p:Configuration=Release
-          MSBuild -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=arm64 /p:Configuration=Release
+          MSBuild -restore -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=x64 /p:Configuration=Release
+          MSBuild -restore -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=arm64 /p:Configuration=Release
 
       - name: Locate and include Classic NanaZip.exe in portable layout
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $root = "NanaZipSrc\Output\Binaries"
