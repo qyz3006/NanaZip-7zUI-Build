@@ -101,7 +101,8 @@ jobs:
           Get-ChildItem -Path $pkgRoot -Recurse -Filter "Mile.Xaml.cpp.obj" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
           Write-Host "Stale Mile.Xaml.cpp.obj cleared (if any)."
 
-      - name: Build all targets (includes Classic + Modern entry points)
+      - name: Build all targets (compiles NanaZipPackage.wapproj = MSIX entry
+          project NanaZip.Modern.FileManager.exe + Universal launchers)
         run: |
           cd NanaZipSrc
           MSBuild -binaryLogger:Output\BuildAllTargets.binlog -m BuildAllTargets.proj
@@ -110,6 +111,48 @@ jobs:
         run: |
           cd NanaZipSrc
           Get-ChildItem -Recurse Output\Binaries\Root\Binaries -Include *.exe | Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 200
+
+      # ------------------------------------------------------------------
+      # 3) The real Modern file-manager launcher (NanaZip.Modern.FileManager.exe)
+      #    is the MSIX entry point compiled by NanaZipPackage.wapproj, but the
+      #    upstream Packaging step only copies NanaZip.Modern.dll + the two
+      #    Universal exes into the portable layout. So the actual GUI you
+      #    double-click (which was showing the Win10 Mica crash / white screen)
+      #    is MISSING from the artifact. Locate it recursively and fold it in
+      #    together with its co-located dependencies (Modern.dll/.xbf/resources.pri).
+      # ------------------------------------------------------------------
+      - name: Locate and include Modern FileManager launcher in portable layout
+        shell: pwsh
+        run: |
+          $root = "NanaZipSrc\Output\Binaries"
+          $destX64 = Join-Path $root "Root\Binaries\x64"
+          $destARM64 = Join-Path $root "Root\Binaries\arm64"
+
+          # Find the compiled Modern FileManager exe anywhere under Output\Binaries.
+          $fmExe = Get-ChildItem -Path $root -Recurse -Filter "NanaZip.Modern.FileManager.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $fmExe) {
+            Write-Error "Modern FileManager exe NOT FOUND after build. Build may have skipped the MSIX entry project."
+            exit 1
+          }
+          Write-Host "Found Modern FileManager exe: $($fmExe.FullName)"
+
+          # Determine arch by parent folder name (x64/arm64) of the discovered exe.
+          $arch = Split-Path (Split-Path $fmExe.FullName -Parent) -Leaf
+          if ($arch -eq "x64") { $dest = $destX64 } elseif ($arch -eq "arm64") { $dest = $destARM64 } else { $dest = $destX64 }
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+          # Copy the exe and everything sitting next to it that the Modern UI needs.
+          $srcDir = Split-Path $fmExe.FullName -Parent
+          $companionPatterns = @("NanaZip.Modern.FileManager.exe",
+                                  "NanaZip.Modern.dll",
+                                  "Mile.Xaml.Styles.SunValley.xbf",
+                                  "resources.pri")
+          foreach ($p in $companionPatterns) {
+            $f = Join-Path $srcDir $p
+            if (Test-Path $f) { Copy-Item -Force $f $dest; Write-Host "Copied $p -> $dest" }
+            else { Write-Host "Companion not present (skip): $p" }
+          }
+          Write-Host "Modern FileManager folded into portable layout at $dest"
 
       - name: Upload Portable Binaries (unsigned, run locally)
         uses: actions/upload-artifact@v7
