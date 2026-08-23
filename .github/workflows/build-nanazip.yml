@@ -98,8 +98,22 @@ jobs:
             Write-Host "Copied Classic NanaZip.exe -> $dest"
           }
 
-      - name: Upload Portable Binaries (unsigned, run locally on Win10)
-        uses: actions/upload-artifact@v7
+      # 把便携布局打成单个 zip，并通过 GitHub Release 发布（而非 upload-artifact），
+      # 原因：fork 仓库的 Actions artifact 经 API 下载返回 401（GitHub 限制），
+      # 而 Release asset 走 /releases/download/ 端点可正常下载。
+      - name: Package portable layout into zip
+        shell: pwsh
+        run: |
+          $src = "NanaZipSrc\Output\Binaries\Root\Binaries"
+          $out = "NanaZip_Classic_Portable.zip"
+          Compress-Archive -Path "$src\*" -DestinationPath $out -Force
+          Write-Host "Packaged $out"
+
+      - name: Publish to GitHub Release (downloadable)
+        uses: softprops/action-gh-release@v2
         with:
-          name: NanaZip_Classic_Portable
-          path: NanaZipSrc/Output/Binaries/Root/Binaries
+          tag_name: classic-build
+          name: NanaZip Classic Portable (Win10-stable)
+          files: NanaZip_Classic_Portable.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
