@@ -89,10 +89,16 @@ jobs:
         uses: microsoft/setup-msbuild@v3
 
       - name: Restore NanaZip (unpack NuGet packages)
-        timeout-minutes: 30
+        # GitHub Windows runner -> nuget.org 网络偶发无限挂起（观测到多次
+        # restore 步骤 in_progress 数小时无进展）。硬性超时 18 分钟，超时即
+        # fail，避免无声冻结浪费 2 小时配额；fail 后由调度方重 dispatch。
+        timeout-minutes: 18
         run: |
           cd NanaZipSrc
-          msbuild -restore BuildAllTargets.proj /p:RestorePackagesConfig=true
+          # 单线程 restore 降低并发连接数，减少在受限网络下卡死概率；
+          # 失败立即非零退出（set -e 已在 bash 层，这里显式检查）。
+          msbuild -restore BuildAllTargets.proj /p:RestorePackagesConfig=true /p:RestoreDisableParallel=true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Overwrite Mile.Xaml.cpp in NuGet cache with patched version
         timeout-minutes: 5
