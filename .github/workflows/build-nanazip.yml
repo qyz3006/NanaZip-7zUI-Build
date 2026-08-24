@@ -1,18 +1,21 @@
-name: Build NanaZip Modern (Win10 Fix) Portable x64
+name: Build NanaZip Modern (Win10 Fix v5) Portable x64
 
-# Build NanaZip Modern with Win10 compatibility patches.
+# Build NanaZip Modern with Win10 compatibility patches (v5).
 #
-# Root cause (UPDATED, v3):
-# Mile.Xaml's MileXamlGlobalInitialize() calls RegisterClassExW("Mile.Xaml.ContentWindow").
-# On Win10, K7ModernInitialize -> NanaZip.Modern.dll -> App::App() -> MileXamlGlobalInitialize()
-# succeeds, but the NanaZip.Modern.Wrapper.cpp wrapper then calls it AGAIN via
-# LoadLibrary/GetProcAddress, causing RegisterClassExW to return
-# ERROR_CLASS_ALREADY_EXISTS. The second call fails, K7ModernInitialize returns
-# E_FAIL, and NanaZip shows "K7ModernInitialize Failed" dialog then exits.
-#
-# Fix: Allow RegisterClassExW to return CLASS_ALREADY_EXISTS (class was already
-# registered in the first successful call). Also keep Mica guard (Win11 only API)
-# from earlier patches.
+# Win10 Modern edition compatibility fixes (all in Mile.Xaml fork):
+# 1. RegisterClassExW CLASS_ALREADY_EXISTS guard (commit 11735d2)
+#    - K7ModernInitialize + App::App() both call MileXamlGlobalInitialize(),
+#      causing RegisterClassExW to fail on Win10. Allow CLASS_ALREADY_EXISTS.
+# 2. Mica guard (commit a64e9c5)
+#    - Mica (MILE_WINDOW_SYSTEM_BACKDROP_TYPE_MICA) is Win11-only.
+#    - On Win10 the framework-internal Mica path corrupts the stack,
+#      causing a silent __fastfail 0xC0000409 crash.
+# 3. TransparentBackground guard (commit 6efc115)
+#    - TransparentBackground=TRUE is only meaningful when Mica is active
+#      (XAML content transparent, Mica provides the backdrop).
+#    - On Win10 without Mica, transparent background causes DWM to fill
+#      the window with white (no backdrop to show through).
+#    - Only set TransparentBackground on Win11, where Mica is active.
 #
 # Build strategy: Per-project restore+build (NOT solution restore, which hangs
 # due to MSIX/wapproj NuGet packages).
@@ -67,6 +70,9 @@ jobs:
           # Verify RegisterClassExW fix
           grep -c "ERROR_CLASS_ALREADY_EXISTS" MileXamlFork/Mile.Xaml.Native/Mile.Xaml.cpp || { echo "ERROR: RegisterClassExW fix not found"; exit 1; }
           echo "  RegisterClassExW fix: OK"
+          # Verify TransparentBackground white-screen fix
+          grep -c "WIN10 WHITE-SCREEN FIX" MileXamlFork/Mile.Xaml.Native/Mile.Xaml.cpp || { echo "ERROR: White-screen fix not found"; exit 1; }
+          echo "  TransparentBackground guard: OK"
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
