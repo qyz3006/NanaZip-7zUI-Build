@@ -55,6 +55,32 @@ jobs:
           echo "=== NanaZipSrc top level ==="
           ls -la
 
+      # ------------------------------------------------------------------
+      # 汉化补丁（2026-08-24）：官方 NanaZip 把 7-Zip 的 Lang 加载逻辑整体
+      # #if 0 桩成了空实现（Lang::Get 非 SFX 永远返回 nullptr），导致 Classic
+      # 版完全不加载外部 Lang/*.txt，外部中文包无效。此处用修复版 Lang.cpp
+      # 覆盖官方文件，恢复外部语言文件加载（Open/Get/OpenFromString 真实实现）。
+      # 配合下方 Lang\zh-cn.txt 即可让 Classic 加载中文界面。
+      # ------------------------------------------------------------------
+      - name: Patch Lang.cpp to enable external language loading
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATCH="patches/lang-cpp-patch.txt"
+          TARGET="NanaZipSrc/NanaZip.Core/SevenZip/CPP/Common/Lang.cpp"
+          if [ ! -f "$PATCH" ]; then
+            echo "ERROR: $PATCH not found in workflow repo."
+            exit 1
+          fi
+          if [ ! -f "$TARGET" ]; then
+            echo "ERROR: $TARGET not found (upstream layout changed?)."
+            exit 1
+          fi
+          cp -f "$PATCH" "$TARGET"
+          echo "Patched $TARGET with restored Lang loading logic."
+          head -3 "$TARGET"
+
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
