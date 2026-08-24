@@ -1,23 +1,23 @@
-name: Build NanaZip Modern (Mica Guard) Portable x64
+name: Build NanaZip Modern (Win10 Fix) Portable x64
 
-# Build NanaZip Modern with Mica guard patch for Win10 compatibility.
+# Build NanaZip Modern with Win10 compatibility patches.
 #
-# Root cause: Mile.Xaml's WM_CREATE handler calls
-# MileSetWindowSystemBackdropTypeAttribute(MICA) unconditionally.
-# Mica is Win11-only; on Win10 it corrupts the XAML framework stack,
-# causing white screen + delayed __fastfail 0xC0000409 crash.
+# Root cause (UPDATED, v3):
+# Mile.Xaml's MileXamlGlobalInitialize() calls RegisterClassExW("Mile.Xaml.ContentWindow").
+# On Win10, K7ModernInitialize -> NanaZip.Modern.dll -> App::App() -> MileXamlGlobalInitialize()
+# succeeds, but the NanaZip.Modern.Wrapper.cpp wrapper then calls it AGAIN via
+# LoadLibrary/GetProcAddress, causing RegisterClassExW to return
+# ERROR_CLASS_ALREADY_EXISTS. The second call fails, K7ModernInitialize returns
+# E_FAIL, and NanaZip shows "K7ModernInitialize Failed" dialog then exits.
 #
-# Fix: Guard the Mica call behind a Win11 version check (VerifyVersionInfoW).
-# The patched Mile.Xaml.cpp source is in qyz3006/Mile.Xaml fork.
-# Mile.Xaml NuGet package uses source injection (targets file adds
-# Mile.Xaml.cpp to the consuming project's ClCompile list), so we
-# replace the source file in the NuGet cache before building.
+# Fix: Allow RegisterClassExW to return CLASS_ALREADY_EXISTS (class was already
+# registered in the first successful call). Also keep Mica guard (Win11 only API)
+# from earlier patches.
 #
-# Build strategy (v2): Per-project restore+build, NOT solution restore.
-# The previous solution-level restore (MSBuild -restore NanaZip.slnx)
-# hangs every time (>35min timeout, confirmed in Run #32).
-# Per-project -restore only downloads what each vcxproj needs,
-# avoiding the heavy MSIX/wapproj packages.
+# Build strategy: Per-project restore+build (NOT solution restore, which hangs
+# due to MSIX/wapproj NuGet packages).
+#
+# Only x64 Release, no arm64.
 
 on:
   workflow_dispatch:
@@ -92,8 +92,11 @@ jobs:
           }
 
       # ------------------------------------------------------------------
-      # Phase 2: Inject Mica guard patch into NuGet cache.
+      # Phase 2: Inject Mile.Xaml patches into NuGet cache.
       # Replace Source\Native\Mile.Xaml.cpp with patched version from fork.
+      # The fork contains:
+      #   - Mica guard (skip Mica on Win10)
+      #   - RegisterClassExW CLASS_ALREADY_EXISTS fix (Win10 double-init)
       # ------------------------------------------------------------------
       - name: Inject Mica guard patch into NuGet cache
         shell: pwsh
@@ -116,39 +119,39 @@ jobs:
           $patchedFile = "MileXamlFork\Mile.Xaml.Native\Mile.Xaml.cpp"
           Copy-Item -Force $patchedFile $targetFile
 
-          # Verify the patch is present
+          # Verify patches are present
           $content = Get-Content $targetFile -Raw
           if ($content -match "WIN10 CRASH FIX") {
-            Write-Host "=== Mica guard patch verified in NuGet cache ==="
+            Write-Host "=== Mica guard patch verified ==="
           } else {
             Write-Error "Mica guard patch NOT found in replaced file!"
             exit 1
           }
+          if ($content -match "ERROR_CLASS_ALREADY_EXISTS") {
+            Write-Host "=== RegisterClassExW fix verified ==="
+          } else {
+            Write-Error "RegisterClassExW fix NOT found in replaced file!"
+            exit 1
+          }
 
       # ------------------------------------------------------------------
-      # Phase 3: Apply try/catch patch to App.cpp
+      # Phase 3: Skip try/catch patch (superseded by RegisterClassExW fix).
+      # The old try/catch around MileXamlGlobalInitialize() was a workaround
+      # that masked the real root cause (CLASS_ALREADY_EXISTS failure).
+      # Removing it so the real fix can work without interference.
       # ------------------------------------------------------------------
-      - name: Apply try/catch patch to App.cpp
+      - name: Verify App.cpp does not have try/catch patch
         shell: pwsh
         run: |
           $appCpp = "NanaZipSrc\NanaZip.Modern\App.cpp"
           $content = Get-Content $appCpp -Raw -Encoding UTF8
 
-          if ($content -match "try\s*\{") {
-            Write-Host "App.cpp already has try/catch patch, skipping"
-            return
+          if ($content -match "try\s*\{\") {
+            Write-Error "App.cpp still has try/catch patch! This must be removed for the RegisterClassExW fix to work."
+            exit 1
           }
 
-          $old = 'winrt::check_hresult(::MileXamlGlobalInitialize());'
-          $new = "          try`n          {`n              winrt::check_hresult(::MileXamlGlobalInitialize());`n          }`n          catch (winrt::hresult_error const&)`n          {`n              // Workaround for CoreWindow null on Win10 XAML Islands`n              // g_CoreWindowHandle is never read by NanaZip, safe to ignore`n          }"
-
-          if ($content.Contains($old)) {
-            $content = $content.Replace($old, $new)
-            Set-Content -Path $appCpp -Value $content -Encoding UTF8 -NoNewline
-            Write-Host "=== Applied try/catch patch to App.cpp ==="
-          } else {
-            Write-Host "WARNING: Could not find target line in App.cpp"
-          }
+          Write-Host "=== App.cpp clean - no try/catch interference ==="
 
       # ------------------------------------------------------------------
       # Phase 4: Build all projects individually (x64 Release only).
@@ -198,12 +201,12 @@ jobs:
           cd NanaZipSrc
           MSBuild -restore -m NanaZip.Core/NanaZip.Core.Sfx.Windows.vcxproj /p:Configuration=Release /p:Platform=x64
 
-      - name: Build NanaZip.Modern (with Mica guard)
+      - name: Build NanaZip.Modern (with Win10 fix)
         timeout-minutes: 15
         shell: pwsh
         run: |
           cd NanaZipSrc
-          Write-Host "=== Building NanaZip.Modern (Mica guard patched source) ==="
+          Write-Host "=== Building NanaZip.Modern (patched source: Mica guard + RegisterClassExW fix) ==="
           MSBuild -restore -m NanaZip.Modern/NanaZip.Modern.vcxproj /p:Configuration=Release /p:Platform=x64
 
       - name: Build NanaZip.Modern.FileManager
@@ -285,6 +288,13 @@ jobs:
               Write-Error "CRITICAL: $cf not found! Build may have failed."
               exit 1
             }
+          }
+
+          # Also try to copy resources.pri from original if not in build output
+          # (resources.pri is an MSIX packaging artifact, not a build output)
+          if (-not (Test-Path (Join-Path $dest "resources.pri"))) {
+            Write-Host "WARNING: resources.pri not found in build output. This is expected for non-MSIX builds."
+            Write-Host "If testing Modern UI, you may need to provide resources.pri from a previous MSIX package."
           }
 
           Write-Host ""
