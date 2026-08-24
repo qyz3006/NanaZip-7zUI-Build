@@ -54,15 +54,19 @@ jobs:
           echo "=== NanaZipSrc top level ==="
           ls -la
 
-      - name: Clone Mile.Xaml fork (Mica patch source)
+      - name: Clone Mile.Xaml fork (Win10 patch source)
         timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
           timeout 300 git clone --depth 1 https://github.com/qyz3006/Mile.Xaml.git MileXamlFork
-          echo "=== Mica patch verification ==="
-          grep -c "WIN10 CRASH FIX" MileXamlFork/Mile.Xaml.Native/Mile.Xaml.cpp || { echo "ERROR: Mica patch not found in fork"; exit 1; }
-          echo "Mica patch confirmed"
+          echo "=== Verifying Mile.Xaml patches ==="
+          # Verify Mica guard
+          grep -c "WIN10 CRASH FIX" MileXamlFork/Mile.Xaml.Native/Mile.Xaml.cpp || { echo "ERROR: Mica patch not found"; exit 1; }
+          echo "  Mica guard: OK"
+          # Verify RegisterClassExW fix
+          grep -c "ERROR_CLASS_ALREADY_EXISTS" MileXamlFork/Mile.Xaml.Native/Mile.Xaml.cpp || { echo "ERROR: RegisterClassExW fix not found"; exit 1; }
+          echo "  RegisterClassExW fix: OK"
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
@@ -135,23 +139,30 @@ jobs:
           }
 
       # ------------------------------------------------------------------
-      # Phase 3: Skip try/catch patch (superseded by RegisterClassExW fix).
-      # The old try/catch around MileXamlGlobalInitialize() was a workaround
-      # that masked the real root cause (CLASS_ALREADY_EXISTS failure).
-      # Removing it so the real fix can work without interference.
+      # Phase 3: Revert try/catch patch if present (superseded by fix).
+      # The old try/catch around MileXamlGlobalInitialize() masked the real
+      # root cause. We must remove it for the RegisterClassExW fix to work.
       # ------------------------------------------------------------------
-      - name: Verify App.cpp does not have try/catch patch
+      - name: Revert try/catch patch in App.cpp if present
         shell: pwsh
         run: |
           $appCpp = "NanaZipSrc\NanaZip.Modern\App.cpp"
           $content = Get-Content $appCpp -Raw -Encoding UTF8
 
-          if ($content -match "try\s*\{\") {
-            Write-Error "App.cpp still has try/catch patch! This must be removed for the RegisterClassExW fix to work."
-            exit 1
+          # Check if try/catch was previously applied
+          if ($content.IndexOf('try') -lt 0) {
+            Write-Host "=== App.cpp clean - no try/catch interference ==="
+            return
           }
 
-          Write-Host "=== App.cpp clean - no try/catch interference ==="
+          Write-Host "=== Found try/catch in App.cpp, reverting... ==="
+
+          # The v2 patch replaced the single line with a multi-line try/catch.
+          # Revert back to original single line.
+          $content = $content -replace '(?s)try\s*\{[^}]*winrt::check_hresult\(::MileXamlGlobalInitialize\(\)\);[^}]*catch[^}]*\}', 'winrt::check_hresult(::MileXamlGlobalInitialize());'
+
+          Set-Content -Path $appCpp -Value $content -Encoding UTF8 -NoNewline
+          Write-Host "=== try/catch patch removed from App.cpp ==="
 
       # ------------------------------------------------------------------
       # Phase 4: Build all projects individually (x64 Release only).
