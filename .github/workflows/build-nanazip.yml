@@ -68,23 +68,20 @@ jobs:
           cd NanaZipSrc
           MSBuild -restore -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=x64 /p:Configuration=Release
 
-      - name: Build Classic arm64 (pure-Win32, Win10-stable)
-        timeout-minutes: 40
-        run: |
-          cd NanaZipSrc
-          MSBuild -restore -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=arm64 /p:Configuration=Release
+      # 用户无 arm 设备，仅编 x64（2026-08-24 收敛）。arm64 步骤已移除。
 
       # 收集 Portable 目录：每个架构子目录下必须同时包含 NanaZip.exe + K7User.dll + K7Base.dll。
       # 关键：K7*.dll 是 NanaZip.UI.Classic 通过 K7User.props / K7Base.props 隐式依赖的运行时
       # 模块（见 NanaZip.exe PE 导入表第 3、4 项）。漏拷会导致用户运行时报
       # "由于找不到 K7User.dll, 无法继续执行代码"。fix 2026-08-24。
-      - name: Locate and include Classic NanaZip.exe + K7*.dll in portable layout
+      # 收集 Portable 目录：x64 子目录下必须同时包含 NanaZip.exe + K7User.dll + K7Base.dll，
+      # 并附带 Lang\zh-cn.txt（中文界面，第二字段必须是 "NanaZip"，LangOpen 校验要求）。
+      - name: Locate and include Classic NanaZip.exe + K7*.dll + Lang in portable layout
         timeout-minutes: 10
         shell: pwsh
         run: |
           $root = "NanaZipSrc\Output\Binaries"
           $destX64 = Join-Path $root "Root\Binaries\x64"
-          $destARM64 = Join-Path $root "Root\Binaries\arm64"
 
           $classicExes = Get-ChildItem -Path $root -Recurse -Filter "NanaZip.exe" -ErrorAction SilentlyContinue
           if ($classicExes.Count -eq 0) {
@@ -94,29 +91,45 @@ jobs:
           Write-Host "Found $($classicExes.Count) Classic exe(s):"
           $classicExes | ForEach-Object { Write-Host "  $($_.FullName)" }
 
-          foreach ($ce in $classicExes) {
-            $srcDir = Split-Path $ce.FullName -Parent
-            $arch = Split-Path $srcDir -Leaf
-            if ($arch -eq "x64") { $dest = $destX64 }
-            elseif ($arch -eq "arm64") { $dest = $destARM64 }
-            else { Write-Warning "Unknown arch '$arch' for $($ce.FullName), default x64"; $dest = $destX64 }
+          # 只取 x64（无 arm 设备，arm64 构建已取消）
+          $ce = $classicExes | Where-Object { (Split-Path (Split-Path $_.FullName -Parent) -Leaf) -eq "x64" } | Select-Object -First 1
+          if (-not $ce) {
+            Write-Error "x64 Classic NanaZip.exe NOT FOUND."
+            exit 1
+          }
+          $srcDir = Split-Path $ce.FullName -Parent
 
-            New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            Copy-Item -Force $ce.FullName $dest
-            Write-Host "Copied Classic NanaZip.exe -> $dest"
+          New-Item -ItemType Directory -Force -Path $destX64 | Out-Null
+          Copy-Item -Force $ce.FullName $destX64
+          Write-Host "Copied Classic NanaZip.exe -> $destX64"
 
-            # 关键依赖：K7User.dll + K7Base.dll（必须与 NanaZip.exe 同目录）
-            foreach ($dep in @("K7User.dll","K7Base.dll")) {
-              $srcDep = Join-Path $srcDir $dep
-              if (Test-Path $srcDep) {
-                Copy-Item -Force $srcDep $dest
-                Write-Host "Copied $dep -> $dest"
-              } else {
-                Write-Warning "Missing dependency: $srcDep"
-                exit 1
-              }
+          # 关键依赖：K7User.dll + K7Base.dll（必须与 NanaZip.exe 同目录）
+          foreach ($dep in @("K7User.dll","K7Base.dll")) {
+            $srcDep = Join-Path $srcDir $dep
+            if (Test-Path $srcDep) {
+              Copy-Item -Force $srcDep $destX64
+              Write-Host "Copied $dep -> $destX64"
+            } else {
+              Write-Warning "Missing dependency: $srcDep"
+              exit 1
             }
           }
+
+          # 中文语言文件：Lang\zh-cn.txt（运行时 GetLangDirPrefix()+zh-cn.txt 自动加载）
+          # 注意第二字段必须是 "NanaZip"（LangOpen 校验），故由仓库内置模板注入。
+          $langDir = Join-Path $destX64 "Lang"
+          New-Item -ItemType Directory -Force -Path $langDir | Out-Null
+          $langSrc = Join-Path $PSScriptRoot ".." "lang-zh-cn.txt"
+          if (-not (Test-Path $langSrc)) {
+            # workflow 仓库根目录下的汉化模板
+            $langSrc = Join-Path (Get-Location) "lang-zh-cn.txt"
+          }
+          if (-not (Test-Path $langSrc)) {
+            Write-Error "lang-zh-cn.txt template NOT FOUND in workflow repo."
+            exit 1
+          }
+          Copy-Item -Force $langSrc (Join-Path $langDir "zh-cn.txt")
+          Write-Host "Copied Lang\zh-cn.txt -> $langDir"
 
       # 把便携布局打成单个 zip，并通过 GitHub Release 发布（而非 upload-artifact），
       # 原因：fork 仓库的 Actions artifact 经 API 下载返回 401（GitHub 限制），
