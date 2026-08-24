@@ -74,7 +74,11 @@ jobs:
           cd NanaZipSrc
           MSBuild -restore -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=arm64 /p:Configuration=Release
 
-      - name: Locate and include Classic NanaZip.exe in portable layout
+      # 收集 Portable 目录：每个架构子目录下必须同时包含 NanaZip.exe + K7User.dll + K7Base.dll。
+      # 关键：K7*.dll 是 NanaZip.UI.Classic 通过 K7User.props / K7Base.props 隐式依赖的运行时
+      # 模块（见 NanaZip.exe PE 导入表第 3、4 项）。漏拷会导致用户运行时报
+      # "由于找不到 K7User.dll, 无法继续执行代码"。fix 2026-08-24。
+      - name: Locate and include Classic NanaZip.exe + K7*.dll in portable layout
         timeout-minutes: 10
         shell: pwsh
         run: |
@@ -91,13 +95,27 @@ jobs:
           $classicExes | ForEach-Object { Write-Host "  $($_.FullName)" }
 
           foreach ($ce in $classicExes) {
-            $arch = Split-Path (Split-Path $ce.FullName -Parent) -Leaf
+            $srcDir = Split-Path $ce.FullName -Parent
+            $arch = Split-Path $srcDir -Leaf
             if ($arch -eq "x64") { $dest = $destX64 }
             elseif ($arch -eq "arm64") { $dest = $destARM64 }
             else { Write-Warning "Unknown arch '$arch' for $($ce.FullName), default x64"; $dest = $destX64 }
+
             New-Item -ItemType Directory -Force -Path $dest | Out-Null
             Copy-Item -Force $ce.FullName $dest
             Write-Host "Copied Classic NanaZip.exe -> $dest"
+
+            # 关键依赖：K7User.dll + K7Base.dll（必须与 NanaZip.exe 同目录）
+            foreach ($dep in @("K7User.dll","K7Base.dll")) {
+              $srcDep = Join-Path $srcDir $dep
+              if (Test-Path $srcDep) {
+                Copy-Item -Force $srcDep $dest
+                Write-Host "Copied $dep -> $dest"
+              } else {
+                Write-Warning "Missing dependency: $srcDep"
+                exit 1
+              }
+            }
           }
 
       # 把便携布局打成单个 zip，并通过 GitHub Release 发布（而非 upload-artifact），
