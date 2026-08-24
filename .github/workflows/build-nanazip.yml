@@ -13,9 +13,11 @@ name: Build NanaZip Modern (Mica Guard) Portable x64
 # Mile.Xaml.cpp to the consuming project's ClCompile list), so we
 # replace the source file in the NuGet cache before building.
 #
-# Also applies a try/catch around MileXamlGlobalInitialize() in App.cpp
-# as defense-in-depth for CoreWindow::GetForCurrentThread() returning
-# null on some Win10 configurations.
+# Build strategy (v2): Per-project restore+build, NOT solution restore.
+# The previous solution-level restore (MSBuild -restore NanaZip.slnx)
+# hangs every time (>35min timeout, confirmed in Run #32).
+# Per-project -restore only downloads what each vcxproj needs,
+# avoiding the heavy MSIX/wapproj packages.
 
 on:
   workflow_dispatch:
@@ -58,55 +60,49 @@ jobs:
         run: |
           set -euo pipefail
           timeout 300 git clone --depth 1 https://github.com/qyz3006/Mile.Xaml.git MileXamlFork
-          echo "=== MileXamlFork Mica patch verification ==="
+          echo "=== Mica patch verification ==="
           grep -c "WIN10 CRASH FIX" MileXamlFork/Mile.Xaml.Native/Mile.Xaml.cpp || { echo "ERROR: Mica patch not found in fork"; exit 1; }
-          echo "Mica patch confirmed in fork"
+          echo "Mica patch confirmed"
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
       # ------------------------------------------------------------------
-      # Step 1: Restore NuGet packages for the solution.
-      # This downloads Mile.Xaml 2.5.1616 (among others) to the NuGet cache.
+      # Phase 1: Restore NanaZip.Modern packages only.
+      # This downloads Mile.Xaml 2.5.1616 to the NuGet cache.
+      # We restore NanaZip.Modern (not the solution) to avoid pulling
+      # MSIX/wapproj packages that cause infinite hangs.
       # ------------------------------------------------------------------
-      - name: Restore NuGet packages (x64 Release)
-        timeout-minutes: 35
+      - name: Restore NanaZip.Modern packages
+        timeout-minutes: 20
         shell: pwsh
         run: |
           cd NanaZipSrc
-          Write-Host "=== Restoring NuGet packages ==="
-          MSBuild -restore -m NanaZip.slnx /p:Configuration=Release /p:Platform=x64
+          Write-Host "=== Restoring NanaZip.Modern packages (x64 Release) ==="
+          MSBuild -t:Restore -m NanaZip.Modern/NanaZip.Modern.vcxproj /p:Configuration=Release /p:Platform=x64
           Write-Host "=== Restore complete ==="
+          # Verify Mile.Xaml is in cache
+          $mileXamlDir = Join-Path $env:USERPROFILE ".nuget\packages\mile.xaml"
+          if (Test-Path $mileXamlDir) {
+            $versions = Get-ChildItem $mileXamlDir -Directory
+            Write-Host "Mile.Xaml versions in cache: $($versions.Name -join ', ')"
+          } else {
+            Write-Error "Mile.Xaml NOT found in NuGet cache after restore!"
+            exit 1
+          }
 
       # ------------------------------------------------------------------
-      # Step 2: Inject Mica guard patch into NuGet cache.
-      # Mile.Xaml NuGet package uses source injection: its .targets file
-      # adds Source\Native\Mile.Xaml.cpp to the consuming project's
-      # ClCompile list. We replace that file with the patched version
-      # from the fork, so the Mica guard gets compiled into NanaZip.Modern.dll.
+      # Phase 2: Inject Mica guard patch into NuGet cache.
+      # Replace Source\Native\Mile.Xaml.cpp with patched version from fork.
       # ------------------------------------------------------------------
       - name: Inject Mica guard patch into NuGet cache
         shell: pwsh
         run: |
-          $nugetRoot = Join-Path $env:USERPROFILE ".nuget\packages\mile.xaml\2.5.1616"
-          $targetFile = Join-Path $nugetRoot "Source\Native\Mile.Xaml.cpp"
+          $mileXamlDir = Join-Path $env:USERPROFILE ".nuget\packages\mile.xaml"
+          $version = (Get-ChildItem $mileXamlDir -Directory | Select-Object -First 1).Name
+          $targetFile = Join-Path $mileXamlDir "$version\Source\Native\Mile.Xaml.cpp"
 
-          if (-not (Test-Path $nugetRoot)) {
-            # Search for any version if exact version not found
-            $mileXamlDir = Join-Path $env:USERPROFILE ".nuget\packages\mile.xaml"
-            if (Test-Path $mileXamlDir) {
-              $versions = Get-ChildItem $mileXamlDir -Directory
-              Write-Host "Available Mile.Xaml versions: $($versions.Name -join ', ')"
-              $nugetRoot = $versions[0].FullName
-              $targetFile = Join-Path $nugetRoot "Source\Native\Mile.Xaml.cpp"
-            } else {
-              Write-Error "Mile.Xaml NuGet package not found in cache"
-              exit 1
-            }
-          }
-
-          Write-Host "NuGet cache path: $nugetRoot"
-          Write-Host "Target file: $targetFile"
+          Write-Host "Target: $targetFile"
 
           if (-not (Test-Path $targetFile)) {
             Write-Error "Mile.Xaml.cpp not found in NuGet package"
@@ -130,9 +126,7 @@ jobs:
           }
 
       # ------------------------------------------------------------------
-      # Step 3: Apply try/catch patch to App.cpp
-      # Defense-in-depth: if CoreWindow::GetForCurrentThread() fails on
-      # some Win10 configs, the try/catch prevents immediate crash.
+      # Phase 3: Apply try/catch patch to App.cpp
       # ------------------------------------------------------------------
       - name: Apply try/catch patch to App.cpp
         shell: pwsh
@@ -154,56 +148,90 @@ jobs:
             Write-Host "=== Applied try/catch patch to App.cpp ==="
           } else {
             Write-Host "WARNING: Could not find target line in App.cpp"
-            Write-Host "Content preview:"
-            Write-Host $content.Substring(0, [Math]::Min(500, $content.Length))
           }
 
       # ------------------------------------------------------------------
-      # Step 4: Build NanaZip (x64 Release only, no arm64)
-      # Build NanaZipPackage.wapproj which pulls in all project references.
-      # The wapproj may fail at MSIX packaging step (signing etc.) but
-      # individual binaries should already be built by then.
+      # Phase 4: Build all projects individually (x64 Release only).
+      # Each project uses -restore to pull its own NuGet dependencies.
+      # Build in dependency order. continue-on-error for non-critical
+      # projects so we still get the core Modern binaries.
       # ------------------------------------------------------------------
-      - name: Build NanaZip x64 Release
-        id: build_wapproj
-        timeout-minutes: 45
+      - name: Build K7Base
+        timeout-minutes: 10
         shell: pwsh
         run: |
           cd NanaZipSrc
-          Write-Host "=== Building NanaZipPackage.wapproj (x64 Release) ==="
-          MSBuild -m NanaZipPackage/NanaZipPackage.wapproj /p:Configuration=Release /p:Platform=x64
+          MSBuild -restore -m K7Base/K7Base.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build K7User
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          cd NanaZipSrc
+          MSBuild -restore -m K7User/K7User.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build NanaZip.Core
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          cd NanaZipSrc
+          MSBuild -restore -m NanaZip.Core/NanaZip.Core.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build NanaZip.Codecs
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          cd NanaZipSrc
+          MSBuild -restore -m NanaZip.Codecs/NanaZip.Codecs.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build NanaZip.Core.Sfx.Console
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          cd NanaZipSrc
+          MSBuild -restore -m NanaZip.Core/NanaZip.Core.Sfx.Console.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build NanaZip.Core.Sfx.Windows
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          cd NanaZipSrc
+          MSBuild -restore -m NanaZip.Core/NanaZip.Core.Sfx.Windows.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build NanaZip.Modern (with Mica guard)
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          cd NanaZipSrc
+          Write-Host "=== Building NanaZip.Modern (Mica guard patched source) ==="
+          MSBuild -restore -m NanaZip.Modern/NanaZip.Modern.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build NanaZip.Modern.FileManager
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          cd NanaZipSrc
+          Write-Host "=== Building NanaZip.Modern.FileManager ==="
+          MSBuild -restore -m NanaZip.UI.Modern/NanaZip.Modern.FileManager.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build NanaZip.Universal.Console
+        timeout-minutes: 10
+        shell: pwsh
         continue-on-error: true
-
-      # Fallback: build individual projects if wapproj fails
-      - name: Build individual projects (fallback)
-        if: steps.build_wapproj.outcome == 'failure'
-        timeout-minutes: 40
-        shell: pwsh
         run: |
           cd NanaZipSrc
-          Write-Host "=== Wapproj build failed, building individual projects ==="
-          $projects = @(
-            "K7Base\K7Base.vcxproj",
-            "K7User\K7User.vcxproj",
-            "NanaZip.Core\NanaZip.Core.vcxproj",
-            "NanaZip.Codecs\NanaZip.Codecs.vcxproj",
-            "NanaZip.Core\NanaZip.Core.Sfx.Console.vcxproj",
-            "NanaZip.Core\NanaZip.Core.Sfx.Windows.vcxproj",
-            "NanaZip.Modern\NanaZip.Modern.vcxproj",
-            "NanaZip.UI.Modern\NanaZip.Modern.FileManager.vcxproj",
-            "NanaZip.Universal\NanaZip.Universal.Console.vcxproj",
-            "NanaZip.Universal\NanaZip.Universal.Windows.vcxproj"
-          )
-          foreach ($proj in $projects) {
-            Write-Host "=== Building $proj ==="
-            MSBuild -m $proj /p:Configuration=Release /p:Platform=x64
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "WARNING: $proj build failed (exit $LASTEXITCODE), continuing..."
-            }
-          }
+          MSBuild -restore -m NanaZip.Universal/NanaZip.Universal.Console.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build NanaZip.Universal.Windows
+        timeout-minutes: 10
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          cd NanaZipSrc
+          MSBuild -restore -m NanaZip.Universal/NanaZip.Universal.Windows.vcxproj /p:Configuration=Release /p:Platform=x64
 
       # ------------------------------------------------------------------
-      # Step 5: Assemble portable package (x64 only)
+      # Phase 5: Assemble portable package (x64 only)
       # ------------------------------------------------------------------
       - name: Assemble portable package
         shell: pwsh
@@ -213,7 +241,6 @@ jobs:
 
           $outputRoot = "NanaZipSrc\Output\Binaries\Release"
           if (-not (Test-Path $outputRoot)) {
-            # Try alternative output path
             $outputRoot = "NanaZipSrc\Output\Binaries"
           }
           Write-Host "=== Searching for built binaries under $outputRoot ==="
@@ -248,26 +275,8 @@ jobs:
             }
           }
 
-          # Copy ShellExtension if present
-          $shellExt = Get-ChildItem -Path $outputRoot -Recurse -Filter "NanaZip.ShellExtension.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($shellExt) {
-            Copy-Item -Force $shellExt.FullName $dest
-            Write-Host "OK: NanaZip.ShellExtension.dll"
-          }
-
-          # Copy AppxManifest if present (needed for resources.pri resolution)
-          $manifest = Get-ChildItem -Path $outputRoot -Recurse -Filter "AppxManifest.xml" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($manifest) {
-            Copy-Item -Force $manifest.FullName $dest
-            Write-Host "OK: AppxManifest.xml"
-          }
-
           Write-Host ""
           Write-Host "=== Summary: $foundCount found, $missingCount missing ==="
-
-          if ($missingCount -gt 0) {
-            Write-Host "WARNING: Some files are missing. Check build output above."
-          }
 
           # Critical files check
           $criticalFiles = @("NanaZip.Modern.dll", "NanaZip.Modern.FileManager.exe")
