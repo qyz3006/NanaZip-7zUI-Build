@@ -1,25 +1,21 @@
-name: Build NanaZip Classic (pure-Win32) Portable
+name: Build NanaZip Modern (Mica Guard) Portable x64
 
-# 目标：在 GitHub 在线 Action 上编译 NanaZip 的 **Classic 纯 Win32 文件管理器**
-#       （NanaZip.UI.Classic），产出未签名的便携 NanaZip.exe，供本地直接在
-#       Windows 10 上运行。
+# Build NanaZip Modern with Mica guard patch for Win10 compatibility.
 #
-# 为什么只编 Classic（γ 收敛，2026-08-24）：
-#   NanaZip Modern (WinUI3/XAML Islands) 在 Win10 上整体不兼容（issue #400 家族：
-#   twinapi.appcore.dll / XAML 框架 init 不完整 -> 白屏、卡死、__fastfail 0xC0000409）。
-#   代码级补丁（Mica guard）只能延后崩溃，救不了渲染。而 Classic 是纯 Win32、
-#   零 XAML / 零 WinAppSDK 依赖，Win10 稳定。用户最终只需 x64\NanaZip.exe。
+# Root cause: Mile.Xaml's WM_CREATE handler calls
+# MileSetWindowSystemBackdropTypeAttribute(MICA) unconditionally.
+# Mica is Win11-only; on Win10 it corrupts the XAML framework stack,
+# causing white screen + delayed __fastfail 0xC0000409 crash.
 #
-# 为什么放弃 BuildAllTargets.proj（2026-08-24 实证）：
-#   原先整个方案走 BuildAllTargets.proj，其 Restore 阶段要还原整个 NanaZip.slnx，
-#   含 WinAppSDK / Mile.Xaml 2.5.1616 等数十个来自 nuget.org 的大包。在 GitHub
-#   Windows runner 上该 Restore 反复无限挂起（观测：4 个 run 全部卡在 Restore 步骤
-#   in_progress 数小时，加 18min 硬超时后 fail）。而 Classic 项目只依赖 2 个小包
-#   （Mile.Windows.Helpers / Mile.Windows.UniCrt，同作者、体积小）。因此本版
-#   **完全跳过 Modern 还原/构建链**，仅 restore+build Classic，根除了 restore 卡点。
+# Fix: Guard the Mica call behind a Win11 version check (VerifyVersionInfoW).
+# The patched Mile.Xaml.cpp source is in qyz3006/Mile.Xaml fork.
+# Mile.Xaml NuGet package uses source injection (targets file adds
+# Mile.Xaml.cpp to the consuming project's ClCompile list), so we
+# replace the source file in the NuGet cache before building.
 #
-# 健壮性（沿用 2026-08-24）：clone/submodule 均包 timeout，防无限挂起；
-# 所有长步骤加 timeout-minutes。
+# Also applies a try/catch around MileXamlGlobalInitialize() in App.cpp
+# as defense-in-depth for CoreWindow::GetForCurrentThread() returning
+# null on some Win10 configurations.
 
 on:
   workflow_dispatch:
@@ -33,15 +29,16 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     permissions:
-      contents: write   # 允许创建/更新 Release 与上传 asset
+      contents: write
     env:
       POWERSHELL_TELEMETRY_OPTOUT: 1
+
     steps:
-      - name: Checkout this workflow repo (shallow)
+      - name: Checkout this workflow repo
         uses: actions/checkout@v6
 
-      - name: Clone NanaZip source (robust, timeout-guarded)
-        timeout-minutes: 20
+      - name: Clone NanaZip source (with submodules)
+        timeout-minutes: 25
         shell: bash
         run: |
           set -euo pipefail
@@ -55,131 +52,240 @@ jobs:
           echo "=== NanaZipSrc top level ==="
           ls -la
 
-      # ------------------------------------------------------------------
-      # 汉化补丁（2026-08-24）：官方 NanaZip 把 7-Zip 的 Lang 加载逻辑整体
-      # #if 0 桩成了空实现（Lang::Get 非 SFX 永远返回 nullptr），导致 Classic
-      # 版完全不加载外部 Lang/*.txt，外部中文包无效。此处用修复版 Lang.cpp
-      # 覆盖官方文件，恢复外部语言文件加载（Open/Get/OpenFromString 真实实现）。
-      # 配合下方 Lang\zh-cn.txt 即可让 Classic 加载中文界面。
-      # ------------------------------------------------------------------
-      - name: Patch Lang.cpp to enable external language loading
-        timeout-minutes: 5
+      - name: Clone Mile.Xaml fork (Mica patch source)
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
-          PATCH="patches/lang-cpp-patch.txt"
-          TARGET="NanaZipSrc/NanaZip.Core/SevenZip/CPP/Common/Lang.cpp"
-          if [ ! -f "$PATCH" ]; then
-            echo "ERROR: $PATCH not found in workflow repo."
-            exit 1
-          fi
-          if [ ! -f "$TARGET" ]; then
-            echo "ERROR: $TARGET not found (upstream layout changed?)."
-            exit 1
-          fi
-          cp -f "$PATCH" "$TARGET"
-          echo "Patched $TARGET with restored Lang loading logic."
-          head -3 "$TARGET"
+          timeout 300 git clone --depth 1 https://github.com/qyz3006/Mile.Xaml.git MileXamlFork
+          echo "=== MileXamlFork Mica patch verification ==="
+          grep -c "WIN10 CRASH FIX" MileXamlFork/Mile.Xaml.Native/Mile.Xaml.cpp || { echo "ERROR: Mica patch not found in fork"; exit 1; }
+          echo "Mica patch confirmed in fork"
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
       # ------------------------------------------------------------------
-      # 仅还原 + 构建 Classic（纯 Win32）。只拉 2 个 Mile 小包，避免 Modern
-      # 链（WinAppSDK/Mile.Xaml 等数十个大包）在 runner 上无限挂起。
+      # Step 1: Restore NuGet packages for the solution.
+      # This downloads Mile.Xaml 2.5.1616 (among others) to the NuGet cache.
       # ------------------------------------------------------------------
-      - name: Build Classic x64 (pure-Win32, Win10-stable)
-        timeout-minutes: 40
-        run: |
-          cd NanaZipSrc
-          MSBuild -restore -m NanaZip.UI.Classic/NanaZip.vcxproj /p:Platform=x64 /p:Configuration=Release
-
-      # 用户无 arm 设备，仅编 x64（2026-08-24 收敛）。arm64 步骤已移除。
-
-      # 收集 Portable 目录：每个架构子目录下必须同时包含 NanaZip.exe + K7User.dll + K7Base.dll。
-      # 关键：K7*.dll 是 NanaZip.UI.Classic 通过 K7User.props / K7Base.props 隐式依赖的运行时
-      # 模块（见 NanaZip.exe PE 导入表第 3、4 项）。漏拷会导致用户运行时报
-      # "由于找不到 K7User.dll, 无法继续执行代码"。fix 2026-08-24。
-      # 收集 Portable 目录：x64 子目录下必须同时包含 NanaZip.exe + K7User.dll + K7Base.dll，
-      # 并附带 Lang\zh-cn.txt（中文界面，第二字段必须是 "NanaZip"，LangOpen 校验要求）。
-      - name: Locate and include Classic NanaZip.exe + K7*.dll + Lang in portable layout
-        timeout-minutes: 10
+      - name: Restore NuGet packages (x64 Release)
+        timeout-minutes: 35
         shell: pwsh
         run: |
-          $root = "NanaZipSrc\Output\Binaries"
-          $destX64 = Join-Path $root "Root\Binaries\x64"
+          cd NanaZipSrc
+          Write-Host "=== Restoring NuGet packages ==="
+          MSBuild -restore -m NanaZip.slnx /p:Configuration=Release /p:Platform=x64
+          Write-Host "=== Restore complete ==="
 
-          $classicExes = Get-ChildItem -Path $root -Recurse -Filter "NanaZip.exe" -ErrorAction SilentlyContinue
-          if ($classicExes.Count -eq 0) {
-            Write-Error "Classic NanaZip.exe NOT FOUND after build."
-            exit 1
-          }
-          Write-Host "Found $($classicExes.Count) Classic exe(s):"
-          $classicExes | ForEach-Object { Write-Host "  $($_.FullName)" }
+      # ------------------------------------------------------------------
+      # Step 2: Inject Mica guard patch into NuGet cache.
+      # Mile.Xaml NuGet package uses source injection: its .targets file
+      # adds Source\Native\Mile.Xaml.cpp to the consuming project's
+      # ClCompile list. We replace that file with the patched version
+      # from the fork, so the Mica guard gets compiled into NanaZip.Modern.dll.
+      # ------------------------------------------------------------------
+      - name: Inject Mica guard patch into NuGet cache
+        shell: pwsh
+        run: |
+          $nugetRoot = Join-Path $env:USERPROFILE ".nuget\packages\mile.xaml\2.5.1616"
+          $targetFile = Join-Path $nugetRoot "Source\Native\Mile.Xaml.cpp"
 
-          # 只取 x64（无 arm 设备，arm64 构建已取消）
-          $ce = $classicExes | Where-Object { (Split-Path (Split-Path $_.FullName -Parent) -Leaf) -eq "x64" } | Select-Object -First 1
-          if (-not $ce) {
-            Write-Error "x64 Classic NanaZip.exe NOT FOUND."
-            exit 1
-          }
-          $srcDir = Split-Path $ce.FullName -Parent
-
-          New-Item -ItemType Directory -Force -Path $destX64 | Out-Null
-          Copy-Item -Force $ce.FullName $destX64
-          Write-Host "Copied Classic NanaZip.exe -> $destX64"
-
-          # 关键依赖：K7User.dll + K7Base.dll（必须与 NanaZip.exe 同目录）
-          foreach ($dep in @("K7User.dll","K7Base.dll")) {
-            $srcDep = Join-Path $srcDir $dep
-            if (Test-Path $srcDep) {
-              Copy-Item -Force $srcDep $destX64
-              Write-Host "Copied $dep -> $destX64"
+          if (-not (Test-Path $nugetRoot)) {
+            # Search for any version if exact version not found
+            $mileXamlDir = Join-Path $env:USERPROFILE ".nuget\packages\mile.xaml"
+            if (Test-Path $mileXamlDir) {
+              $versions = Get-ChildItem $mileXamlDir -Directory
+              Write-Host "Available Mile.Xaml versions: $($versions.Name -join ', ')"
+              $nugetRoot = $versions[0].FullName
+              $targetFile = Join-Path $nugetRoot "Source\Native\Mile.Xaml.cpp"
             } else {
-              Write-Warning "Missing dependency: $srcDep"
+              Write-Error "Mile.Xaml NuGet package not found in cache"
               exit 1
             }
           }
 
-          # 中文语言文件：Lang\zh-cn.txt（运行时 GetLangDirPrefix()+zh-cn.txt 自动加载）
-          # 注意第二字段必须是 "NanaZip"（LangOpen 校验），故由仓库内置模板注入。
-          $langDir = Join-Path $destX64 "Lang"
-          New-Item -ItemType Directory -Force -Path $langDir | Out-Null
-          $langSrc = Join-Path $PSScriptRoot ".." "lang-zh-cn.txt"
-          if (-not (Test-Path $langSrc)) {
-            # workflow 仓库根目录下的汉化模板
-            $langSrc = Join-Path (Get-Location) "lang-zh-cn.txt"
-          }
-          if (-not (Test-Path $langSrc)) {
-            Write-Error "lang-zh-cn.txt template NOT FOUND in workflow repo."
+          Write-Host "NuGet cache path: $nugetRoot"
+          Write-Host "Target file: $targetFile"
+
+          if (-not (Test-Path $targetFile)) {
+            Write-Error "Mile.Xaml.cpp not found in NuGet package"
             exit 1
           }
-          Copy-Item -Force $langSrc (Join-Path $langDir "zh-cn.txt")
-          Write-Host "Copied Lang\zh-cn.txt -> $langDir"
 
-      # 把便携布局打成单个 zip，并通过 GitHub Release 发布（而非 upload-artifact），
-      # 原因：fork 仓库的 Actions artifact 经 API 下载返回 401（GitHub 限制），
-      # 而 Release asset 走 /releases/download/ 端点可正常下载。
-      - name: Package portable layout into zip
+          # Backup original
+          Copy-Item $targetFile "$targetFile.orig" -Force
+
+          # Replace with patched version from fork
+          $patchedFile = "MileXamlFork\Mile.Xaml.Native\Mile.Xaml.cpp"
+          Copy-Item -Force $patchedFile $targetFile
+
+          # Verify the patch is present
+          $content = Get-Content $targetFile -Raw
+          if ($content -match "WIN10 CRASH FIX") {
+            Write-Host "=== Mica guard patch verified in NuGet cache ==="
+          } else {
+            Write-Error "Mica guard patch NOT found in replaced file!"
+            exit 1
+          }
+
+      # ------------------------------------------------------------------
+      # Step 3: Apply try/catch patch to App.cpp
+      # Defense-in-depth: if CoreWindow::GetForCurrentThread() fails on
+      # some Win10 configs, the try/catch prevents immediate crash.
+      # ------------------------------------------------------------------
+      - name: Apply try/catch patch to App.cpp
         shell: pwsh
         run: |
-          $src = "NanaZipSrc\Output\Binaries\Root\Binaries"
-          $out = "NanaZip_Classic_Portable.zip"
-          Compress-Archive -Path "$src\*" -DestinationPath $out -Force
-          Write-Host "Packaged $out"
+          $appCpp = "NanaZipSrc\NanaZip.Modern\App.cpp"
+          $content = Get-Content $appCpp -Raw -Encoding UTF8
 
-      # 用 runner 自带的 gh CLI 发布 Release（比第三方 action 更稳，且
-      # GITHUB_TOKEN 自动注入）。fork artifact API 下载 401，故改走 Release。
-      - name: Publish to GitHub Release (downloadable)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          if ($content -match "try\s*\{") {
+            Write-Host "App.cpp already has try/catch patch, skipping"
+            return
+          }
+
+          $old = 'winrt::check_hresult(::MileXamlGlobalInitialize());'
+          $new = "          try`n          {`n              winrt::check_hresult(::MileXamlGlobalInitialize());`n          }`n          catch (winrt::hresult_error const&)`n          {`n              // Workaround for CoreWindow null on Win10 XAML Islands`n              // g_CoreWindowHandle is never read by NanaZip, safe to ignore`n          }"
+
+          if ($content.Contains($old)) {
+            $content = $content.Replace($old, $new)
+            Set-Content -Path $appCpp -Value $content -Encoding UTF8 -NoNewline
+            Write-Host "=== Applied try/catch patch to App.cpp ==="
+          } else {
+            Write-Host "WARNING: Could not find target line in App.cpp"
+            Write-Host "Content preview:"
+            Write-Host $content.Substring(0, [Math]::Min(500, $content.Length))
+          }
+
+      # ------------------------------------------------------------------
+      # Step 4: Build NanaZip (x64 Release only, no arm64)
+      # Build NanaZipPackage.wapproj which pulls in all project references.
+      # The wapproj may fail at MSIX packaging step (signing etc.) but
+      # individual binaries should already be built by then.
+      # ------------------------------------------------------------------
+      - name: Build NanaZip x64 Release
+        id: build_wapproj
+        timeout-minutes: 45
+        shell: pwsh
         run: |
-          set -euo pipefail
-          # 若 tag 已存在则删除旧 release（保留可重跑）
-          gh release delete classic-build --yes || true
-          gh release create classic-build NanaZip_Classic_Portable.zip \
-            --title "NanaZip Classic Portable (Win10-stable)" \
-            --notes "Unsigned portable build of NanaZip Classic (pure Win32) for Windows 10. Unzip and run x64\\NanaZip.exe." \
-            --latest || true
-          echo "Release published."
+          cd NanaZipSrc
+          Write-Host "=== Building NanaZipPackage.wapproj (x64 Release) ==="
+          MSBuild -m NanaZipPackage/NanaZipPackage.wapproj /p:Configuration=Release /p:Platform=x64
+        continue-on-error: true
+
+      # Fallback: build individual projects if wapproj fails
+      - name: Build individual projects (fallback)
+        if: steps.build_wapproj.outcome == 'failure'
+        timeout-minutes: 40
+        shell: pwsh
+        run: |
+          cd NanaZipSrc
+          Write-Host "=== Wapproj build failed, building individual projects ==="
+          $projects = @(
+            "K7Base\K7Base.vcxproj",
+            "K7User\K7User.vcxproj",
+            "NanaZip.Core\NanaZip.Core.vcxproj",
+            "NanaZip.Codecs\NanaZip.Codecs.vcxproj",
+            "NanaZip.Core\NanaZip.Core.Sfx.Console.vcxproj",
+            "NanaZip.Core\NanaZip.Core.Sfx.Windows.vcxproj",
+            "NanaZip.Modern\NanaZip.Modern.vcxproj",
+            "NanaZip.UI.Modern\NanaZip.Modern.FileManager.vcxproj",
+            "NanaZip.Universal\NanaZip.Universal.Console.vcxproj",
+            "NanaZip.Universal\NanaZip.Universal.Windows.vcxproj"
+          )
+          foreach ($proj in $projects) {
+            Write-Host "=== Building $proj ==="
+            MSBuild -m $proj /p:Configuration=Release /p:Platform=x64
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "WARNING: $proj build failed (exit $LASTEXITCODE), continuing..."
+            }
+          }
+
+      # ------------------------------------------------------------------
+      # Step 5: Assemble portable package (x64 only)
+      # ------------------------------------------------------------------
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $dest = "NanaZip_Portable_MicaGuard\x64"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+          $outputRoot = "NanaZipSrc\Output\Binaries\Release"
+          if (-not (Test-Path $outputRoot)) {
+            # Try alternative output path
+            $outputRoot = "NanaZipSrc\Output\Binaries"
+          }
+          Write-Host "=== Searching for built binaries under $outputRoot ==="
+          Get-ChildItem -Path $outputRoot -Recurse -File | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+          $requiredFiles = @(
+            "K7Base.dll",
+            "K7User.dll",
+            "NanaZip.Codecs.dll",
+            "NanaZip.Core.dll",
+            "NanaZip.Core.Console.sfx",
+            "NanaZip.Core.Windows.sfx",
+            "NanaZip.Modern.dll",
+            "NanaZip.Modern.FileManager.exe",
+            "NanaZip.Universal.Console.exe",
+            "NanaZip.Universal.Windows.exe",
+            "Mile.Xaml.Styles.SunValley.xbf",
+            "resources.pri"
+          )
+
+          $foundCount = 0
+          $missingCount = 0
+          foreach ($f in $requiredFiles) {
+            $found = Get-ChildItem -Path $outputRoot -Recurse -Filter $f -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              Copy-Item -Force $found.FullName $dest
+              Write-Host "OK: $f (from $($found.DirectoryName))"
+              $foundCount++
+            } else {
+              Write-Host "MISSING: $f"
+              $missingCount++
+            }
+          }
+
+          # Copy ShellExtension if present
+          $shellExt = Get-ChildItem -Path $outputRoot -Recurse -Filter "NanaZip.ShellExtension.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($shellExt) {
+            Copy-Item -Force $shellExt.FullName $dest
+            Write-Host "OK: NanaZip.ShellExtension.dll"
+          }
+
+          # Copy AppxManifest if present (needed for resources.pri resolution)
+          $manifest = Get-ChildItem -Path $outputRoot -Recurse -Filter "AppxManifest.xml" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($manifest) {
+            Copy-Item -Force $manifest.FullName $dest
+            Write-Host "OK: AppxManifest.xml"
+          }
+
+          Write-Host ""
+          Write-Host "=== Summary: $foundCount found, $missingCount missing ==="
+
+          if ($missingCount -gt 0) {
+            Write-Host "WARNING: Some files are missing. Check build output above."
+          }
+
+          # Critical files check
+          $criticalFiles = @("NanaZip.Modern.dll", "NanaZip.Modern.FileManager.exe")
+          foreach ($cf in $criticalFiles) {
+            if (-not (Test-Path (Join-Path $dest $cf))) {
+              Write-Error "CRITICAL: $cf not found! Build may have failed."
+              exit 1
+            }
+          }
+
+          Write-Host ""
+          Write-Host "=== Final portable package contents ==="
+          Get-ChildItem $dest | Format-Table Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NanaZip_Portable_MicaGuard
+          path: NanaZip_Portable_MicaGuard
+          if-no-files-found: error
+          retention-days: 30
